@@ -22,9 +22,6 @@ Modification notice
 Modification of DynaPhoPy to allow for treatment of organic
 crystals and other complex systems.
 
-This branch will continue contain the exact modified version used in 
-doi:XXXXX. For further improved versions see the other branches.
-
 The changes were done for DynaPhoPy version 1.17.15
 
 List of major changes:
@@ -51,6 +48,7 @@ List of major changes:
   - improved parallelization for certain steps in the projection
   - fixed a bug which would lead to incorrect results for triclinic system 
     unit cells with a non-uniform supercell vector
+  - improved computational efficiency of the correlation
 
 Installation instructions
 ---------------------------------------------------------
