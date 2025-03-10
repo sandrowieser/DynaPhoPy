@@ -537,12 +537,12 @@ def eval_dynaphopy_kappa(
             print("loading file " + vc_files[qid] + " for q-point " + str(qp) + "...")
             vc_file_name = vc_files[qid]
             vcdata = h5py.File(vc_file_name)
-            if args.read_to is not None:
-                vcvals = vcdata["vc"][args.read_from - 1 : args.read_to]
-                timevals = vcdata["time"][args.read_from - 1 : args.read_to]
+            if read_to is not None:
+                vcvals = vcdata["vc"][read_from - 1 : read_to]
+                timevals = vcdata["time"][read_from - 1 : read_to]
             else:
-                vcvals = vcdata["vc"][args.read_from - 1 :]
-                timevals = vcdata["time"][args.read_from - 1 :]
+                vcvals = vcdata["vc"][read_from - 1 :]
+                timevals = vcdata["time"][read_from - 1 :]
             trajectory_2_step.set_time(np.array(timevals))
             trajectory = [
                 np.array(vcvals),
