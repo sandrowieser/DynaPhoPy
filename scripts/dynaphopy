@@ -6,8 +6,15 @@ import dynaphopy.interface.iofile as reading
 import dynaphopy.interface.interactive_ui as interactive_ui
 import dynaphopy.generate_cell as generate
 from dynaphopy.interface.phonopy_link import get_force_sets_from_file, get_force_constants_from_file
+import time
+import h5py
+import os
 
 from fractions import Fraction
+
+import matplotlib.pyplot as plt
+pltstyle="~/ez-grp_style.mplstyle"
+plt.style.use(pltstyle)
 
 # Define arguments
 parser = argparse.ArgumentParser(description='DynaPhoPy options')
@@ -20,11 +27,22 @@ group.add_argument('md_file', metavar='trajectory', type=str, nargs='?',
 group.add_argument('-lv', '--load_data', metavar='file', type=str, nargs=1,
                    help='load MD data from hdf5 file')
 
+# Feature added by Sandro Wieser
+parser.add_argument('-lvc', '--load_vc', metavar='file', type=str,
+                   help='load vc from hdf5 file, still needs to load the first 2 steps of a lammps trajectory. If read_to and read_from are set, only a portion is taken')
+parser.add_argument('-fv', '--first_val', type=int, default=1,
+                   help='index of the first value in the trajectory file - currently only used with the --vel_lmp option')
+parser.add_argument('-fd', '--figdir', metavar='file', type=str,
+                   help='directory name to store figures')
+parser.add_argument('--phana', metavar='phana', type=str, default=None,
+                   help='use eigenvectors from fix_phonon to compute the projection. Need to specify the .bin file')
+
 parser.add_argument('-i', '--interactive', action='store_true',
                     help='enter interactive mode')
 
 parser.add_argument('-q', metavar='F', type=str, nargs=3,
                     help='wave vector used to calculate projections (default: 0 0 0)')
+
 
 parser.add_argument('-r', '--frequency_range', metavar='F', type=float, nargs=2,
                     help='frequency range of power spectrum in THz (min, max)')
@@ -59,6 +77,9 @@ parser.add_argument('-sv', '--save_data', metavar='file', type=str, nargs=1, def
 parser.add_argument('-svc', '--save_vc_hdf5', metavar='file', type=str, nargs=1, default=False,
                     help='save wave vector projected velocity into hdf5 file')
 
+parser.add_argument('-svcq', '--save_vc_hdf5_all_q', dest='save_vc_hdf5_all_q', default=False, action='store_true',
+                    help='save wave vector projected velocities into a set pf hdf5 files for all q points')
+
 parser.add_argument('-psm', '--power_spectrum_algorithm', metavar='N', type=int, nargs=1,
                     help='select power spectrum calculation algorithm (default MEM)')
 
@@ -91,6 +112,8 @@ parser.add_argument('--thm_full', action='store_true',
 
 parser.add_argument('-sdata', '--save_quasiparticle_data', action='store_true',
                     help='save quasiparticle data into a YAML formatted file')
+parser.add_argument('-sdataq', '--save_quasiparticle_data_at_q', action='store_true',
+                    help='save quasiparticle data at specific q point into a YAML formatted file')
 
 parser.add_argument('-smesh', '--save_mesh_data', action='store_true',
                     help='save mesh data into a YAML formatted file')
@@ -105,6 +128,9 @@ parser.add_argument('--silent', action='store_true',
 
 parser.add_argument('--velocity_only', action='store_true',
                     help='loads only velocity data from hdf5 file')
+
+parser.add_argument('--vel_lmp', action='store_true',
+                    help='loads velocity data and evaluates it on-the-fly without ever storing the entire data in the RAM')
 
 parser.add_argument('--fitting_function', metavar='index', type=int, default=0,
                     help='define fitting function (default: Lorentzian)')
@@ -237,27 +263,61 @@ if args.load_data:
                                                    final_cut=args.read_to,
                                                    memmap=args.memmap)
     structure_file = args.load_data[0]
-if args.md_file:
-    trajectory_reading_function = reading.get_trajectory_parser(args.md_file)
-    if trajectory_reading_function is None:
-        print('Trajectory file format not recognized')
-        exit()
-    if args.auto_order:
-        print ('Use auto order')
-        template = reading.check_atoms_order(args.md_file, trajectory_reading_function, structure)
-    else:
-        template = None
+    
 
-    trajectory = trajectory_reading_function(args.md_file,
-                                             structure,
-                                             args.time_step,
-                                             initial_cut=args.read_from,
-                                             end_cut=args.read_to,
-                                             memmap=args.memmap,
-                                             template=template
-                                             )
+
+if args.md_file:
+    if args.vel_lmp | (args.load_vc is not None):
+        # modified by Sandro Wieser
+        print("reading LAMMPS input on-the-fly")
+        from dynaphopy.interface.iofile import trajectory_parsers as tp
+        
+        trajectory_reading_function = tp.read_lammps_trajectory
+        
+        # Here, we read the first 2 steps to create the trajectory object containing the structure and similar information
+        # 2 steps are needed so the time step method in the dynamics object works
+        trajectory = trajectory_reading_function(args.md_file,
+                                                 structure,
+                                                 args.time_step,
+                                                 initial_cut=0,
+                                                 end_cut=2
+                                                 )
+    else:
+        start_time = time.time()
+        trajectory_reading_function = reading.get_trajectory_parser(args.md_file)
+        if trajectory_reading_function is None:
+            print('Trajectory file format not recognized')
+            exit()
+        if args.auto_order:
+            print ('Use auto order')
+            template = reading.check_atoms_order(args.md_file, trajectory_reading_function, structure)
+        else:
+            template = None
+    
+        trajectory = trajectory_reading_function(args.md_file,
+                                                 structure,
+                                                 args.time_step,
+                                                 initial_cut=args.read_from,
+                                                 end_cut=args.read_to,
+                                                 memmap=args.memmap,
+                                                 template=template
+                                                 )
+        print("Read trajectory in %.2f s" % (time.time()-start_time))
     # np.savetxt('trajectory.xyz', trajectory.trajectory.real[0], fmt='C %.4e %.4e %.4e')
 
+
+if args.load_vc is not None:
+    vcdata = h5py.File(args.load_vc)
+    if args.read_to is not None:
+        vcvals = vcdata["vc"][args.read_from-1:args.read_to]
+        timevals = vcdata["time"][args.read_from-1:args.read_to]
+    else:
+        vcvals = vcdata["vc"][args.read_from-1:]
+        timevals = vcdata["time"][args.read_from-1:]
+    trajectory.set_time(np.array(timevals))
+    trajectory = [np.array(vcvals), np.array(vcdata["reduced_q_vector"]), trajectory]
+    
+    
 if args.generate_trajectory:
     trajectory = reading.generate_test_trajectory(structure,
                                                   total_time=args.generate_trajectory[0],
@@ -279,17 +339,38 @@ if args.run_lammps:
                                             velocity_only=args.velocity_only,
                                             temperature=args.temperature)
 
+# added by Sandro Wieser
+if args.figdir is not None:
+    if not os.path.exists(args.figdir):
+        os.mkdir(args.figdir)
+
 if isinstance(trajectory, list) or isinstance(trajectory, tuple):
     print('Loading projected velocity only (limited features only)')
-    calculation = dynaphopy.Quasiparticle(trajectory[2], vc=trajectory[0], last_steps=args.n)
+    calculation = dynaphopy.Quasiparticle(trajectory[2], 
+                                          vc=trajectory[0], 
+                                          last_steps=args.n,
+                                          figdir=args.figdir)
     input_parameters.update({'_reduced_q_vector': trajectory[1], '_use_symmetry': False})
 
 else:
-    calculation = dynaphopy.Quasiparticle(trajectory, last_steps=args.n)
+    if args.vel_lmp:
+        calculation = dynaphopy.Quasiparticle(trajectory, 
+                                              last_steps=args.n, 
+                                              traj_file=args.md_file, 
+                                              read_from=args.read_from, 
+                                              read_to=args.read_to, 
+                                              first_val=args.first_val,
+                                              figdir=args.figdir)
+    else:
+        calculation = dynaphopy.Quasiparticle(trajectory, 
+                                              last_steps=args.n,
+                                              figdir=args.figdir)
 
 
 calculation.parameters.get_data_from_dict(input_parameters)
 
+if args.phana is not None:
+    calculation.set_phana(args.phana)
 
 # Set Parameters
 calculation.parameters.silent = args.silent
@@ -326,6 +407,9 @@ if args.number_of_mem_coefficients:
 # Process save properties
 if args.save_vc_hdf5:
     calculation.save_vc_hdf5(args.save_vc_hdf5[0])
+    
+if args.save_vc_hdf5_all_q:
+    calculation.save_vc_hdf5_all_q(symmetry=True)
 
 if args.save_vq:
     calculation.save_vq(args.save_vq[0])
@@ -374,6 +458,9 @@ if args.save_atomic_displacements:
 
 if args.save_quasiparticle_data:
     calculation.write_quasiparticles_data(with_extra=args.save_extra_properties)
+    
+if args.save_quasiparticle_data_at_q:
+    calculation.write_quasiparticles_data_at_q(with_extra=args.save_extra_properties, qpoint=calculation.get_reduced_q_vector())
 
 if args.save_mesh_data:
     calculation.write_mesh_data()

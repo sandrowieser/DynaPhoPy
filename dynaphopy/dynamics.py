@@ -13,7 +13,7 @@ class Dynamics:
                  energy=None,
                  time=None,
                  supercell=None,
-                 memmap=False):
+                 memmap=False,):
 
         self._time = time
         self._trajectory = trajectory
@@ -108,7 +108,7 @@ class Dynamics:
 
     def get_number_of_atoms(self):
         if self._number_of_atoms is None:
-            self._number_of_atoms = self.structure.get_number_of_atoms()*np.prod(self.get_supercell_matrix())
+            self._number_of_atoms = self.structure.get_number_of_atoms()*np.product(self.get_supercell_matrix())
         return self._number_of_atoms
 
     def set_time(self, time):
@@ -191,15 +191,21 @@ class Dynamics:
             return np.linalg.norm(h, axis=1)
 
         if self._supercell_matrix is None:
-            supercell_matrix_real = np.divide(parameters(self.get_supercell()), parameters(self.structure.get_cell()))
+            # SW: The original definition is incorrect in some cases, it only works in cases when there are no offdiagonal elements in the cell matrix, or if the supercell is a XxXxX matrix, where X is the same in all directions
+            # supercell_matrix_real = np.divide(parameters(self.get_supercell()), parameters(self.structure.get_cell()))
+            
+            # this definition should always work
+            supercell_matrix_real = np.matmul(np.linalg.inv(self.structure.get_cell()),self.get_supercell())
             self._supercell_matrix = np.around(supercell_matrix_real).astype("int")
-
-            if abs(sum(self._supercell_matrix - supercell_matrix_real)/np.linalg.norm(supercell_matrix_real)) > tolerance:
-                print(abs(sum(self._supercell_matrix - supercell_matrix_real) / np.linalg.norm(supercell_matrix_real)))
+            # print(supercell_matrix_real,self.structure.get_cell(),self.get_supercell())
+            if abs(np.sum(self._supercell_matrix - supercell_matrix_real)/np.linalg.norm(supercell_matrix_real)) > tolerance:
+                print(abs(np.sum(self._supercell_matrix - supercell_matrix_real) / np.linalg.norm(supercell_matrix_real)))
                 print('Warning! Defined unit cell and MD supercell do not match!')
                 print('Cell size relation is not integer: {0}'.format(supercell_matrix_real))
                 exit()
-
+            
+            # need only the diagonal elements of the supercell matrix
+            self._supercell_matrix = np.diagonal(self._supercell_matrix)
             print('MD cell size relation: {0}'.format(self._supercell_matrix))
 
         return self._supercell_matrix

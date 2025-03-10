@@ -1,7 +1,8 @@
-__version__ = '1.17.16'
+__version__ = '1.17.15'
 import dynaphopy.projection as projection
 import dynaphopy.parameters as parameters
 import dynaphopy.interface.phonopy_link as pho_interface
+import dynaphopy.interface.phana_link as pha_interface
 import dynaphopy.interface.iofile as reading
 import dynaphopy.analysis.energy as energy
 import dynaphopy.analysis.fitting as fitting
@@ -20,8 +21,22 @@ class Quasiparticle:
     def __init__(self,
                  dynamic,
                  last_steps=None,
-                 vc=None):
-
+                 vc=None,
+                 traj_file=None,
+                 read_from=None,
+                 read_to=None,
+                 first_val=1,
+                 figdir=None,):
+        
+        # traj_file added by Sandro Wieser - for on-the-fly reading
+        self._traj_file = traj_file
+        self._read_from = read_from
+        self._read_to = read_to
+        self._first_val = first_val
+        self._figdir = figdir
+        
+        self._phanafile = None
+        
         self._dynamic = dynamic
         self._vc = vc
         self._eigenvectors = None
@@ -113,15 +128,83 @@ class Quasiparticle:
         print("Velocity saved in file " + file_name)
 
     def save_vc_hdf5(self, file_name):
-
+        # SW: need to do this first before get_time is called
+        vc=self.get_vc()
         reading.save_data_hdf5(file_name,
                                self.dynamic.get_time(),
                                self.dynamic.get_supercell_matrix(),
-                               vc=self.get_vc(),
+                               vc=vc,
                                reduced_q_vector=self.get_reduced_q_vector())
 
         print("Projected velocity saved in file " + file_name)
 
+    def save_vc_hdf5_all_q(self, symmetry = False):
+        # SW: new method to read the trajectory and compute the vcs of all q-points at once
+        # if symmetry is set to True only symmetry inequivalent q-points are taken
+        # to reduce the memory demand of this implementation, it would make sense to integrate the file output directly in the projection function
+        # TODO
+        if self.parameters.project_on_atom > -1:
+                element = self.dynamic.structure.get_atomic_elements(unique=True)[self.parameters.project_on_atom]
+                print('Project on atom {} : {}'.format(self.parameters.project_on_atom, element))
+        
+        md_supercell = self.dynamic.get_supercell_matrix()
+        # to get the commensurate q-points, use phonopy
+        if symmetry:
+            from phonopy.structure.grid_points import GridPoints
+            ph = pho_interface.get_phonon(self.dynamic.structure)
+            pgops = ph.get_primitive_symmetry().get_pointgroup_operations()
+            lattice = ph.get_primitive().get_cell()
+            reciprocal_lattice = np.linalg.inv(lattice).T*2*np.pi
+            gpobj = GridPoints(md_supercell,
+                       reciprocal_lattice,
+                       q_mesh_shift=None,  # Monkhorst-Pack style grid shift
+                       is_gamma_center=True,
+                       is_time_reversal=True,
+                       fit_in_BZ=True,
+                       rotations=pgops,  # Point group operations in real space
+                       is_mesh_symmetry=True)
+            
+            irqpoints = gpobj.get_ir_qpoints()
+            print("Evaluating these irreducible q points on the MD supercell:")
+            print(irqpoints)
+            qpoints = irqpoints
+        else:
+            qpoints = pho_interface.get_commensurate_points(self.dynamic.structure,
+                                                            md_supercell)
+        if not self.check_commensurate(self.get_reduced_q_vector()):
+            print("warning! This wave vector is not a commensurate q-point in MD supercell")
+
+        assert self._traj_file is not None, "ERROR: evaluation of vc for all q-points is only supported in on-the-fly reading mode."        
+        
+        all_vc = projection.project_onto_wave_vector_lammps_vel(self._traj_file, 
+                                                              self.dynamic, 
+                                                              qpoints, 
+                                                              project_on_atom=self.parameters.project_on_atom,
+                                                              start_vel=self._read_from,
+                                                              end_vel=self._read_to,
+                                                              silent=self.parameters.silent,
+                                                              first_vel=self._first_val)
+        self.dynamic.set_time(np.linspace(0, (all_vc[0].shape[0] - 1) * self.dynamic.get_time_step_average(),
+                           num=all_vc[0].shape[0]))
+        
+        for vid, vc in enumerate(all_vc):
+            qp = qpoints[vid]
+            qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+            file_name = "vc_%s.hdf5" % (qpstr)
+            reading.save_data_hdf5(file_name,
+                                   self.dynamic.get_time(),
+                                   self.dynamic.get_supercell_matrix(),
+                                   vc=vc,
+                                   reduced_q_vector=self.get_reduced_q_vector())
+            
+        self._vc = all_vc[0]
+        
+        if symmetry:
+            symstr = "symmetry inequivalent q points"
+        else:
+            symstr = "all q points"
+        print("Projected velocities for %s saved in files " % (symstr))
+        
     def set_number_of_mem_coefficients(self, coefficients):
         self.power_spectra_clear()
         self.parameters.number_of_coefficients_mem = coefficients
@@ -146,9 +229,14 @@ class Quasiparticle:
     def set_frequency_limits(self, limits):
         resolution = self.parameters.spectrum_resolution
         self._set_frequency_range(np.arange(limits[0], limits[1] + resolution, resolution))
+        
+    def set_phana(self, phanafile):
+        # tags needed for phana
+        self._phanafile = phanafile
 
     def get_frequency_range(self):
         return self.parameters.frequency_range
+    
 
     # Wave vector related methods
     def set_reduced_q_vector(self, q_vector):
@@ -169,17 +257,28 @@ class Quasiparticle:
     def get_eigenvectors(self):
         if self._eigenvectors is None:
             # print("Getting frequencies & eigenvectors from Phonopy")
-            self._eigenvectors, self._frequencies = (
-                pho_interface.obtain_eigenvectors_and_frequencies(self.dynamic.structure,
-                                                                  self.parameters.reduced_q_vector))
+            if self._phanafile is None:
+                self._eigenvectors, self._frequencies = (
+                    pho_interface.obtain_eigenvectors_and_frequencies(self.dynamic.structure,
+                                                                      self.parameters.reduced_q_vector))
+            else:
+                self._eigenvectors, self._frequencies = (
+                    pha_interface.obtain_phana_eigenvectors_and_frequencies(self.parameters.reduced_q_vector, 
+                                                                           fname = self._phanafile))
         return self._eigenvectors
 
     def get_frequencies(self):
         if self._frequencies is None:
             # print("Getting frequencies & eigenvectors from Phonopy")
-            self._eigenvectors, self._frequencies = (
-                pho_interface.obtain_eigenvectors_and_frequencies(self.dynamic.structure,
-                                                                  self.parameters.reduced_q_vector))
+            
+            if self._phanafile is None:
+                self._eigenvectors, self._frequencies = (
+                    pho_interface.obtain_eigenvectors_and_frequencies(self.dynamic.structure,
+                                                                      self.parameters.reduced_q_vector))
+            else:
+                self._eigenvectors, self._frequencies = (
+                    pha_interface.obtain_phana_eigenvectors_and_frequencies(self.parameters.reduced_q_vector, 
+                                                                           fname = self._phanafile))
         return self._frequencies
 
     def set_band_ranges(self, band_ranges):
@@ -630,10 +729,24 @@ class Quasiparticle:
             if self.parameters.project_on_atom > -1:
                 element = self.dynamic.structure.get_atomic_elements(unique=True)[self.parameters.project_on_atom]
                 print('Project on atom {} : {}'.format(self.parameters.project_on_atom, element))
-
-            self._vc = projection.project_onto_wave_vector(self.dynamic,
-                                                           self.get_q_vector(),
-                                                           project_on_atom=self.parameters.project_on_atom)
+            
+            # added by Sandro Wieser - for on-the-fly reading
+            if self._traj_file is not None:
+                self._vc = projection.project_onto_wave_vector_lammps_vel(self._traj_file, 
+                                                                          self.dynamic, 
+                                                                          [self.get_q_vector()], 
+                                                                          project_on_atom=self.parameters.project_on_atom,
+                                                                          start_vel=self._read_from,
+                                                                          end_vel=self._read_to,
+                                                                          silent=self.parameters.silent,
+                                                                          first_vel=self._first_val)[0]
+                # the -1 is there to be consistent with the original - starting at 0
+                self.dynamic.set_time(np.linspace(0, (self._vc.shape[0] - 1) * self.dynamic.get_time_step_average(),
+                           num=self._vc.shape[0]))
+            else:
+                self._vc = projection.project_onto_wave_vector(self.dynamic,
+                                                               self.get_q_vector(),
+                                                               project_on_atom=self.parameters.project_on_atom)
         return self._vc
 
     def get_vq(self):
@@ -857,17 +970,19 @@ class Quasiparticle:
 
     def phonon_individual_analysis(self):
         print("Peak analysis analysis")
-
-        fitting.phonon_fitting_analysis(self.get_power_spectrum_phonon(),
+        
+        # SW: changed to return the return values for easier automation
+        return fitting.phonon_fitting_analysis(self.get_power_spectrum_phonon(),
                                         self.parameters.frequency_range,
                                         harmonic_frequencies=self.get_frequencies(),
                                         thermal_expansion_shift=self.get_qha_shift(self.get_reduced_q_vector()),
                                         show_plots=not self.parameters.silent,
                                         fitting_function_type=self.parameters.fitting_function,
                                         use_degeneracy=self.parameters.use_symmetry,
-                                        show_occupancy=self.parameters.project_on_atom < 0  # temporal interface
+                                        show_occupancy=self.parameters.project_on_atom < 0,  # temporal interface
+                                        figdir=self._figdir
                                         )
-        return
+        
 
     def plot_power_spectrum_full(self):
 
@@ -910,7 +1025,7 @@ class Quasiparticle:
         # plt.legend()
         plt.show()
 
-        total_integral = integrate.simpson(self.get_power_spectrum_full(), x=self.get_frequency_range())
+        total_integral = integrate.simps(self.get_power_spectrum_full(), x=self.get_frequency_range())
         print("Total Area (Kinetic energy <K>): {0} eV".format(total_integral))
 
     def plot_power_spectrum_wave_vector(self):
@@ -920,7 +1035,7 @@ class Quasiparticle:
         plt.ylabel('eV * ps')
         plt.axhline(y=0, color='k', ls='dashed')
         plt.show()
-        total_integral = integrate.simpson(self.get_power_spectrum_wave_vector(), x=self.get_frequency_range())
+        total_integral = integrate.simps(self.get_power_spectrum_wave_vector(), x=self.get_frequency_range())
         print("Total Area (Kinetic energy <K>): {0} eV".format(total_integral))
 
     def plot_power_spectrum_phonon(self):
@@ -931,8 +1046,12 @@ class Quasiparticle:
             plt.xlabel('Frequency [THz]')
             plt.ylabel('eV * ps')
             plt.axhline(y=0, color='k', ls='dashed')
-
-        plt.show()
+            
+            # added by Sandro Wieser
+            if self._figdir is not None:
+                plt.savefig("%s/power_spectrum_%03d.png" % (self._figdir,i))
+        if self._figdir is None:
+            plt.show()
 
     # Plot dynamical properties related methods
     def plot_trajectory(self, atoms=None, coordinates=None):
@@ -1031,14 +1150,14 @@ class Quasiparticle:
         reading.write_curve_to_file(self.get_frequency_range(),
                                     self.get_power_spectrum_full()[None].T,
                                     file_name)
-        total_integral = integrate.simpson(self.get_power_spectrum_full(), x=self.get_frequency_range())
+        total_integral = integrate.simps(self.get_power_spectrum_full(), x=self.get_frequency_range())
         print("Total Area (Kinetic energy <K>): {0} eV".format(total_integral))
 
     def write_power_spectrum_wave_vector(self, file_name):
         reading.write_curve_to_file(self.get_frequency_range(),
                                     self.get_power_spectrum_wave_vector()[None].T,
                                     file_name)
-        total_integral = integrate.simpson(self.get_power_spectrum_wave_vector(), x=self.get_frequency_range())
+        total_integral = integrate.simps(self.get_power_spectrum_wave_vector(), x=self.get_frequency_range())
         print("Total Area (Kinetic energy <K>): {0} eV".format(total_integral))
 
     def write_power_spectrum_phonon(self, file_name):
@@ -1092,7 +1211,8 @@ class Quasiparticle:
     def get_algorithm_list(self):
         return power_spectrum_functions.values()
 
-    def get_commensurate_points_data(self, auto_range=True):
+    def get_commensurate_points_data(self, auto_range=True, qlist=None):
+        # Sandro Wieser: added option to compute specific q points instead of just commensurate ones
 
         if self._commensurate_points_data is None:
 
@@ -1111,8 +1231,11 @@ class Quasiparticle:
             else:
                 fc_supercell = self.dynamic.structure.get_supercell_phonon()
 
-            com_points = pho_interface.get_commensurate_points(self.dynamic.structure,
-                                                               fc_supercell)
+            if qlist is None:
+                com_points = pho_interface.get_commensurate_points(self.dynamic.structure,
+                                                                   fc_supercell)
+            else:
+                com_points = qlist
 
             initial_reduced_q_vector = self.get_reduced_q_vector()
 
@@ -1151,7 +1274,8 @@ class Quasiparticle:
                                                        thermal_expansion_shift=self.get_qha_shift(reduced_q_vector),
                                                        show_plots=False,
                                                        fitting_function_type=self.parameters.fitting_function,
-                                                       use_degeneracy=self.parameters.use_symmetry)
+                                                       use_degeneracy=self.parameters.use_symmetry,
+                                                       figdir=self._figdir)
 
                 positions = data['positions']
                 widths = data['widths']
@@ -1205,16 +1329,19 @@ class Quasiparticle:
 
         return self._renormalized_force_constants
 
-    def get_commensurate_points_properties(self):
+    def get_commensurate_points_properties(self, qlist=None):
 
         #  Decide the size of the supercell to use to calculate the renormalized force constants
         if self._parameters.use_MD_cell_commensurate:
             fc_supercell = np.diag(self.dynamic.get_supercell_matrix())
         else:
             fc_supercell = self.dynamic.structure.get_supercell_phonon()
-
-        com_points = pho_interface.get_commensurate_points(self.dynamic.structure,
-                                                           fc_supercell)
+        
+        if qlist is None:
+            com_points = pho_interface.get_commensurate_points(self.dynamic.structure,
+                                                               fc_supercell)
+        else:
+            com_points = qlist
 
         group_velocity_list = []
         q_points_list = []
@@ -1240,6 +1367,12 @@ class Quasiparticle:
         if with_extra:
             quasiparticle_data.update(self.get_commensurate_points_properties())
         reading.save_quasiparticle_data_to_file(quasiparticle_data, filename)
+        
+    def write_quasiparticles_data_at_q(self, filename="quasiparticles_data_q.yaml", with_extra=False, qpoint=[0,0,0]):
+        quasiparticle_data = self.get_commensurate_points_data(qlist=[qpoint])
+        if with_extra:
+            quasiparticle_data.update(self.get_commensurate_points_properties(qlist=[qpoint]))
+        reading.save_quasiparticle_data_to_file(quasiparticle_data, filename)
 
     def write_mesh_data(self, file_name='mesh_data.yaml'):
         mesh_data = self.get_mesh_frequencies_and_linewidths()
@@ -1260,7 +1393,7 @@ class Quasiparticle:
         free_energy = thm.get_free_energy(temperature, phonopy_dos[0], phonopy_dos[1])
         entropy = thm.get_entropy(temperature, phonopy_dos[0], phonopy_dos[1])
         c_v = thm.get_cv(temperature, phonopy_dos[0], phonopy_dos[1])
-        integration = integrate.simpson(phonopy_dos[1], x=phonopy_dos[0]) / (
+        integration = integrate.simps(phonopy_dos[1], x=phonopy_dos[0]) / (
             self.dynamic.structure.get_number_of_atoms() *
             self.dynamic.structure.get_number_of_dimensions())
         total_energy = thm.get_total_energy(temperature, phonopy_dos[0], phonopy_dos[1])
@@ -1319,7 +1452,7 @@ class Quasiparticle:
 
             power_spectrum_dos = thm.get_dos(temperature, frequency_range, self.get_power_spectrum_full(),
                                              normalization)
-            integration = integrate.simpson(power_spectrum_dos, x=frequency_range) / (
+            integration = integrate.simps(power_spectrum_dos, x=frequency_range) / (
                 self.dynamic.structure.get_number_of_atoms() *
                 self.dynamic.structure.get_number_of_dimensions())
 

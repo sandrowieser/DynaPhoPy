@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Oct 13 12:04:37 2023
+
+@author: sandro_w
+
+
+This script serves as a wrapper to perform dynaphopy evaluations. The primary purpose is to compute the thermal conductivity
+"""
+
+import argparse
+import sys
+import numpy as np
+import h5py
+import os
+import matplotlib.pyplot as plt
+
+import dynaphopy
+import dynaphopy.interface.iofile as reading
+import dynaphopy.projection as projection
+from dynaphopy.interface.phonopy_link import (
+    get_force_sets_from_file,
+    get_force_constants_from_file,
+    ForceConstants,
+)
+from dynaphopy.interface.iofile import trajectory_parsers as tp
+
+# from phonopy.harmonic.dynmat_to_fc import DynmatToForceConstants
+from dynaphopy.interface.phonopy_link import get_phonon
+from dynaphopy.interface.phonopy_link import (
+    get_renormalized_force_constants,
+    obtain_eigenvectors_and_frequencies,
+)
+from phonopy.phonon.thermal_properties import mode_cv as get_mode_cv
+from phonopy.units import THzToEv
+from phonopy.harmonic.dynmat_to_fc import (
+    get_commensurate_points,
+)  # symmetries are now handled using the GridPoints class
+from phonopy.structure.grid_points import GridPoints
+from phonopy.file_IO import read_force_constants_hdf5
+import phonopy as phpy
+from phonopy.units import EV, Angstrom, Kb, THz, VaspToTHz
+from phonopy.harmonic.dynmat_to_fc import DynmatToForceConstants
+from phonopy.harmonic.force_constants import set_tensor_symmetry_PJ
+
+# this is the only phono3py dependency - unfortunately, the grid points class from phonopy is not quite enough
+from phono3py.phonon.grid import (
+    BZGrid,
+    get_ir_grid_points,
+    get_grid_points_by_rotations,
+)
+
+
+def read_ir_grid_points(fname):
+    fp = open(fname, "r")
+    gpnums = []
+    qps = []
+    for line in fp:
+        elements = line.split()
+        if len(elements) > 0:
+            if elements[0] == "mesh:":
+                mesh = [
+                    int(elements[2].split(",")[0]),
+                    int(elements[3].split(",")[0]),
+                    int(elements[4]),
+                ]
+        if len(elements) > 1:
+            if elements[1] == "grid_point:":
+                gpnums.append(int(elements[2]))
+            elif elements[0] == "q-point:":
+                qps.append(
+                    [
+                        float(elements[2].split(",")[0]),
+                        float(elements[3].split(",")[0]),
+                        float(elements[4]),
+                    ]
+                )
+    odict = {}
+    odict["gpnums"] = gpnums
+    odict["mesh"] = mesh
+    odict["qpoints"] = np.array(qps)
+    return odict
+
+
+# def get_renorm_FCmat_from_dynmats(symmetrize=True):
+#
+#    phonon = get_phonon(structure, setup_forces=False, custom_supercell=fc_supercell)
+#
+#    primitive = phonon.get_primitive()
+#    supercell = phonon.get_supercell()
+#
+#    dynmat2fc = DynmatToForceConstants(primitive, supercell)
+#
+#    size = structure.get_number_of_dimensions() * structure.get_number_of_primitive_atoms()
+#    eigenvectors = np.array([eigenvector.reshape(size, size, order='C').T for eigenvector in eigenvectors ])
+#    renormalized_frequencies = np.array(renormalized_frequencies)
+#
+#    try:
+#        dynmat2fc.set_dynamical_matrices(renormalized_frequencies / VaspToTHz, eigenvectors)
+#
+#    except TypeError:
+#        frequencies_thz = renormalized_frequencies / VaspToTHz
+#        eigenvalues = frequencies_thz ** 2 * np.sign(frequencies_thz)
+#        dynmat2fc.create_dynamical_matrices(eigenvalues=eigenvalues,
+#                                            eigenvectors=eigenvectors)
+#
+#    dynmat2fc.run()
+#
+#    force_constants = ForceConstants(dynmat2fc.get_force_constants(), supercell=fc_supercell)
+#
+#    # Symmetrize force constants using crystal symmetry
+#    if symmetrize:
+#        print('Symmetrizing force constants')
+#        set_tensor_symmetry_PJ(force_constants.get_array(),
+#                               phonon.supercell.get_cell(),
+#                               phonon.supercell.get_scaled_positions(),
+#                               phonon.symmetry)
+#
+#    return force_constants
+
+
+def compute_vc_files(dynobj, qpoints, symmetry=True):
+
+    qv_recip = []
+    for qp in qpoints:
+        qv_recip.append(
+            np.dot(
+                qp,
+                2.0
+                * np.pi
+                * np.linalg.inv(dynobj.dynamic.structure.get_primitive_cell()).T,
+            )
+        )
+    all_vc = projection.project_onto_wave_vector_lammps_vel(
+        dynobj._traj_file,
+        dynobj.dynamic,
+        np.array(qv_recip),
+        project_on_atom=dynobj.parameters.project_on_atom,
+        start_vel=dynobj._read_from,
+        end_vel=dynobj._read_to,
+        silent=dynobj.parameters.silent,
+        first_vel=dynobj._first_val,
+    )
+    dynobj.dynamic.set_time(
+        np.linspace(
+            0,
+            (all_vc[0].shape[0] - 1) * dynobj.dynamic.get_time_step_average(),
+            num=all_vc[0].shape[0],
+        )
+    )
+
+    for vid, vc in enumerate(all_vc):
+        qp = qpoints[vid]
+        qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+        file_name = "vc_%s.hdf5" % (qpstr)
+        reading.save_data_hdf5(
+            file_name,
+            dynobj.dynamic.get_time(),
+            dynobj.dynamic.get_supercell_matrix(),
+            vc=vc,
+            reduced_q_vector=qp,
+        )
+
+    dynobj._vc = all_vc[0]
+
+    print("Projected velocities saved in vc hdf5 files")
+
+
+def update_h5(hdf5_file, key, data, dtype=None):
+    if key not in hdf5_file.keys():
+        hdf5_file.create_dataset(key, data=np.array(data), dtype=dtype)
+    else:
+        stored_quantity = hdf5_file[key]
+        stored_quantity[()] = data
+
+
+def get_cv(temperatures, freqs, cutoff_freq=5000):
+    """
+    I stole the base version of this from phono3py. credit goes to A. Togo
+    Dimension is temperature : number_of_modes
+    """
+    temperatures = np.array(temperatures)
+    cv = np.zeros((len(temperatures), len(freqs)), dtype="double")
+    # T/freq has to be large enough to avoid divergence.
+    # Otherwise just set 0.
+    for i, f in enumerate(freqs):
+        finite_t = temperatures > f / 100
+        if f > cutoff_freq:
+            cv[:, i] = np.where(
+                finite_t,
+                get_mode_cv(np.where(finite_t, temperatures, 10000), f * THzToEv),
+                0,
+            )
+    return cv
+
+
+def dyn_partial_clear(dyn):
+    # clears everything that is not vc
+    dyn._eigenvectors = None
+    dyn._frequencies = None
+    dyn._vq = None
+    dyn._power_spectrum_direct = None
+    dyn._power_spectrum_wave_vector = None
+    dyn._power_spectrum_phonon = None
+
+
+def write_2_col(ofname, timevals, data):
+    with open(ofname, "w") as fp:
+        for t, d in zip(timevals, data):
+            fp.write("%12.8f %12.8f\n" % (t, d))
+
+
+def get_renormalized_force_constants(
+    renormalized_frequencies,
+    eigenvectors,
+    structure,
+    fc_supercell,
+    symmetrize=True,
+    dynobj=None,
+    comm_points=None,
+):
+
+    if dynobj is None:
+        phonon = get_phonon(
+            structure, setup_forces=False, custom_supercell=fc_supercell
+        )
+        primitive = phonon.get_primitive()
+        supercell = phonon.get_supercell()
+
+        dynmat2fc = DynmatToForceConstants(primitive, supercell)
+    else:
+        dynmat2fc = dynobj
+
+    if comm_points is not None:
+        dynmat2fc.commensurate_points = comm_points
+
+    size = (
+        structure.get_number_of_dimensions() * structure.get_number_of_primitive_atoms()
+    )
+    eigenvectors = np.array(
+        [eigenvector.reshape(size, size, order="C").T for eigenvector in eigenvectors]
+    )
+    renormalized_frequencies = np.array(renormalized_frequencies)
+
+    try:
+        # print(renormalized_frequencies / VaspToTHz)
+        # this method takes only 2 arguments, self and dynmat, this can NEVER work
+        # dynmat2fc.set_dynamical_matrices(renormalized_frequencies / VaspToTHz, eigenvectors)
+        dynmat2fc.create_dynamical_matrices(
+            (renormalized_frequencies / VaspToTHz) ** 2
+            * np.sign(renormalized_frequencies),
+            eigenvectors,
+        )
+
+    except TypeError as e:
+        print(e)
+        frequencies_thz = renormalized_frequencies / VaspToTHz
+        eigenvalues = frequencies_thz**2 * np.sign(frequencies_thz)
+        dynmat2fc.create_dynamical_matrices(
+            eigenvalues=eigenvalues, eigenvectors=eigenvectors
+        )
+
+    dynmat2fc.run()
+
+    force_constants = ForceConstants(
+        dynmat2fc.get_force_constants(), supercell=fc_supercell
+    )
+
+    # Symmetrize force constants using crystal symmetry
+    if symmetrize:
+        print("Symmetrizing force constants")
+        set_tensor_symmetry_PJ(
+            force_constants.get_array(),
+            phonon.supercell.get_cell(),
+            phonon.supercell.get_scaled_positions(),
+            phonon.symmetry,
+        )
+
+    return force_constants
+
+
+def eval_dynaphopy_kappa(
+    difname,
+    trajfname,
+    ir_yaml=None,
+    read_from=1,
+    read_to=None,
+    ts=0.001,
+    first_val=1,
+    ph3py_template=None,
+    temperature=300,
+    frequency_range=[0, 100],
+    renorm_vg=False,
+    nosym=False,
+    silent=False,
+    palgo=2,
+    resolution=0.001,
+    symprec=1e-5,
+):
+
+    warning_list = []
+    # set up dynaphopy
+    # Get data from input file & process parameters
+    #### INPUT PARAMETER FILE PROCESSING START ####
+    input_parameters = reading.read_parameters_from_input_file(difname)
+
+    if "structure_file_name_outcar" in input_parameters:
+        structure = reading.read_from_file_structure_outcar(
+            input_parameters["structure_file_name_outcar"]
+        )
+        structure_file = input_parameters["structure_file_name_outcar"]
+    else:
+        structure = reading.read_from_file_structure_poscar(
+            input_parameters["structure_file_name_poscar"]
+        )
+        structure_file = input_parameters["structure_file_name_poscar"]
+
+    structure.get_data_from_dict(input_parameters)
+
+    if "supercell_phonon" in input_parameters:
+        supercell_phonon = input_parameters["supercell_phonon"]
+    else:
+        supercell_phonon = np.identity(3)
+
+    if "force_sets_file_name" in input_parameters:
+        structure.set_force_set(
+            get_force_sets_from_file(
+                file_name=input_parameters["force_sets_file_name"],
+                fs_supercell=supercell_phonon,
+            )
+        )
+
+    if "force_constants_file_name" in input_parameters:
+        structure.set_force_constants(
+            get_force_constants_from_file(
+                file_name=input_parameters["force_constants_file_name"],
+                fc_supercell=supercell_phonon,
+            )
+        )
+
+    if (
+        "force_sets_file_name" in input_parameters
+        and "force_constants_file_name" in input_parameters
+    ):
+        assert (
+            False
+        ), "Both FORCE SETS and FORCE CONSTANTS are found in input file, only one is allowed"
+
+    #### INPUT PARAMETER FILE PROCESSING END ####
+
+    # read trajectory
+    trajectory_reading_function = tp.read_lammps_trajectory
+
+    # Here, we read the first 2 steps to create the trajectory object containing the structure and similar information
+    # 2 steps are needed so the time step method in the dynamics object works
+    trajectory_2_step = trajectory_reading_function(
+        trajfname, structure, ts, initial_cut=0, end_cut=2
+    )
+    eigenvectors = []
+    all_freqs = []
+
+    ph = get_phonon(trajectory_2_step.structure, symprec=symprec)
+
+    # phono3py version - same results as the phonopy grid points
+
+    bz_grid = BZGrid(
+        trajectory_2_step.get_supercell_matrix(),
+        lattice=ph.get_primitive().get_cell(),
+        symmetry_dataset=ph._primitive_symmetry.dataset,
+        is_time_reversal=True,
+        use_grg=False,
+        store_dense_gp_map=True,
+    )
+
+    ir_grid_points, ir_grid_weights, ir_grid_map = get_ir_grid_points(bz_grid)
+    # here, the grid points are chosen in a way that they are within the 1. BZ
+    actual_bz_gps = np.array(bz_grid.grg2bzg[ir_grid_points], dtype="int_")
+    #    print(ir_grid_points)
+    #    print(ir_grid_weights)
+    #    print(ir_grid_map)
+
+    # TODO: would be nice to have a symmetryless option, where the spectra for symmetry equivalent points are averaged, as dynaphopy could do
+    #    if nosym:
+    #        pg_ops = None
+    #    else:
+    pg_ops = ph._primitive_symmetry.get_pointgroup_operations()
+
+    gpobj = GridPoints(
+        trajectory_2_step.get_supercell_matrix(),
+        np.linalg.inv(ph.get_primitive().get_cell()).T
+        * 2
+        * np.pi,  # reciprocal cell vectors
+        rotations=pg_ops,
+    )
+    # this has to be done to get all the qpoints in the grid that correspond to the grid addresses
+    # required for figuring out equivalent q-points
+    shift = np.array(gpobj._is_shift) * 0.5
+    all_qpoints = np.array(
+        (gpobj.get_grid_address() + shift) / gpobj.mesh_numbers,
+        dtype="double",
+        order="C",
+    )
+
+    # get the actual qpoints in the phono3py definition
+    all_bz_qpoints = []
+    for qid in range(len(bz_grid.addresses)):
+        all_bz_qpoints.append(
+            np.dot(bz_grid.Q, bz_grid.addresses[qid] / bz_grid.D_diag.astype("double"))
+        )
+    #        print(bz_grid.addresses[qid],all_qpoints[qid],bz_grid.get_indices_from_addresses(bz_grid.addresses[qid]),
+    #              np.dot(bz_grid.Q, bz_grid.addresses[qid] / bz_grid.D_diag.astype('double')))
+    all_bz_qpoints = np.array(all_bz_qpoints)
+    scmat = trajectory_2_step.get_supercell_matrix()
+    if ir_yaml is not None:
+        ir_data = read_ir_grid_points(ir_yaml)
+        qpoints = ir_data["qpoints"]
+        gpnums = ir_data["gpnums"]
+    else:
+        if nosym:
+            qpoints = all_qpoints
+            gpnums = range(len(qpoints))
+        else:
+            # qpoints = gpobj.get_ir_qpoints()  # careful: the definition of this differs somewhat from phono3py - not exactly the same ir points are computed, however, this script should be able to detect equivalent q points properly
+
+            # gpnums = gpobj.ir_grid_points
+
+            # this is the definition consistent with phono3py
+            gpnums = actual_bz_gps
+            qpoints = []
+            for gpnum in gpnums:
+                qpoints.append(all_bz_qpoints[gpnum])
+                # print(gpnum,all_bz_qpoints[gpnum])
+            qpoints = np.array(qpoints)
+
+    #    print(gpobj.get_ir_grid_points())
+    #    print(gpobj.get_ir_grid_weights())
+    #    print(gpobj.get_grid_mapping_table())
+
+    if os.path.exists("force_constants_ren.hdf5"):
+        renormalize_force_constants = False
+    else:
+        renormalize_force_constants = True
+    if os.path.exists("mesh_and_warnings.dat"):
+        warning_file = open(
+            "mesh_and_warnings.dat", "a"
+        )  # append to allow for restarts
+    else:
+        warning_file = open("mesh_and_warnings.dat", "w")
+        warning_file.write(
+            "MD cell size relation: [%d %d %d]\n" % (scmat[0], scmat[1], scmat[2])
+        )
+    print("evaluating %d q-points" % len(qpoints))
+
+    # figure out for which grid points a computation should still be performed
+    vc_files = []
+    to_compute = []
+    for qid, qp in enumerate(qpoints):
+
+        gpnum = gpnums[qid]
+        # the bz grid gp_map attribute can convert grid points from the BZ convention to the GridPoints convention
+        gp_gpnum = np.where(bz_grid.gp_map == gpnum)[0][0]
+        # print(gp_gpnum)
+        # print(get_grid_points_by_rotations(gpnum,bz_grid))
+        # print(len(gpobj.grid_mapping_table),len(all_qpoints))
+        equivalent_qpoints = all_qpoints[gpobj.grid_mapping_table == gp_gpnum]
+        # print(equivalent_qpoints)
+        qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+        vc_file_name = "vc_%s.hdf5" % (qpstr)
+        if os.path.exists(vc_file_name):
+            vc_file_exists = True
+        else:
+            print("%s does not exist, checking equivalent q points..." % vc_file_name)
+            vc_file_exists = False
+            for equiv_qp in equivalent_qpoints:
+                qpstr = "%f_%f_%f" % (
+                    equiv_qp[0],
+                    equiv_qp[1],
+                    equiv_qp[2],
+                )  # might be useful to check if equivalent q-points exist
+                # check if vc file for this qpoint already exists
+                if read_to is not None:
+                    vc_file_name = "vc_%s_%d.out" % (qpstr, read_to)
+                    if os.path.exists(vc_file_name):
+                        vc_file_exists = True
+                        break  # too lazy
+                    vc_file_name = "vc_%s_%d.hdf5" % (qpstr, read_to)
+                    if os.path.exists(vc_file_name):
+                        vc_file_exists = True
+                        break  # too lazy
+                vc_file_name = "vc_%s.hdf5" % (qpstr)
+                if os.path.exists(vc_file_name):
+                    vc_file_exists = True
+                    break  # too lazy
+
+        if vc_file_exists:
+            vc_files.append(vc_file_name)
+        else:
+            qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+            vc_files.append("vc_%s.hdf5" % (qpstr))
+            to_compute.append(qp)
+
+    # compute missing q-points
+    if len(to_compute) > 0:
+        print("evaluating missing vcs for these q-points:")
+        print(np.array(to_compute))
+        calculation = dynaphopy.Quasiparticle(
+            trajectory_2_step,
+            last_steps=None,
+            traj_file=trajfname,
+            read_from=read_from,
+            read_to=read_to,
+            first_val=first_val,
+        )
+        calculation.parameters.silent = silent
+        calculation.set_reduced_q_vector(np.array(qp))
+        compute_vc_files(calculation, to_compute)
+
+    all_errors = []
+    ren_qpoints = []
+    for qid, qp in enumerate(qpoints):
+        gpnum = gpnums[qid]
+        kappafname = "kappa-m%d%d%d-g%d.hdf5" % (scmat[0], scmat[1], scmat[2], gpnum)
+
+        if not os.path.exists(kappafname):
+            calc_gp = True
+        else:
+            calc_gp = False
+            print("found %s, skipping grid point %d" % (kappafname, gpnum))
+        if calc_gp:
+
+            figdir = "projection_figures_" + str(gpnum)
+            if not os.path.exists(figdir):
+                os.mkdir(figdir)
+            print("grid point:", gpnum)
+
+            print("loading file " + vc_files[qid] + " for q-point " + str(qp) + "...")
+            vc_file_name = vc_files[qid]
+            vcdata = h5py.File(vc_file_name)
+            if args.read_to is not None:
+                vcvals = vcdata["vc"][args.read_from - 1 : args.read_to]
+                timevals = vcdata["time"][args.read_from - 1 : args.read_to]
+            else:
+                vcvals = vcdata["vc"][args.read_from - 1 :]
+                timevals = vcdata["time"][args.read_from - 1 :]
+            trajectory_2_step.set_time(np.array(timevals))
+            trajectory = [
+                np.array(vcvals),
+                np.array(vcdata["reduced_q_vector"]),
+                trajectory_2_step,
+            ]
+            calculation = dynaphopy.Quasiparticle(
+                trajectory[2], vc=trajectory[0], last_steps=None, figdir=figdir
+            )
+            calculation.parameters.silent = silent
+            input_parameters.update(
+                {"_reduced_q_vector": np.array(qp), "_use_symmetry": False}
+            )
+            calculation.parameters.get_data_from_dict(input_parameters)
+            calculation.set_reduced_q_vector(np.array(qp))
+            dyn_partial_clear(calculation)
+            calculation.select_power_spectra_algorithm(palgo)
+
+            # write_vc = False
+            #            else:
+            #
+            #                print("computing q-point:", qp)
+            #                calculation = dynaphopy.Quasiparticle(trajectory_2_step,
+            #                                                  last_steps=None,
+            #                                                  traj_file=trajfname,
+            #                                                  read_from=read_from,
+            #                                                  read_to=read_to,
+            #                                                  first_val=first_val,
+            #                                                  figdir=figdir)
+            #                calculation.set_reduced_q_vector(np.array(qp))
+            #                calculation.save_vc_hdf5(vc_file_name)
+            # calculation.parameters.get_data_from_dict(input_parameters)
+            calculation.set_frequency_limits(frequency_range)
+            calculation.set_spectra_resolution(resolution)
+            # perform the actual analysis
+
+            phonon_dict = calculation.phonon_individual_analysis()
+
+            # print out the raw spectra
+            all_vq = calculation.get_power_spectrum_phonon()
+            freqs = calculation.get_frequency_range()
+            for mid in range(np.shape(all_vq)[1]):
+                ofname = "%s/mode_%03d.spec" % (figdir, mid)
+                write_2_col(ofname, freqs, all_vq[:, mid])
+            ofname = "%s/mode_sum.spec" % (figdir)
+            write_2_col(ofname, freqs, np.sum(all_vq, axis=1))
+
+            all_errors.append(phonon_dict["error"])
+            # print(phonon_dict["widths"])
+            zero_widths = np.array(phonon_dict["widths"]) == 0
+            if np.sum(zero_widths) > 0:
+                warning_list.append(
+                    "WARNING: Zero Gamma detected in grid point "
+                    + str(gpnum)
+                    + " for modes with ids "
+                    + str(np.array(np.where(np.array(phonon_dict["widths"]) == 0))[0])
+                )
+                warning_file.write(warning_list[-1] + "\n")
+
+            # ph = get_phonon(calculation.dynamic.structure) # to get the eigenvectors from the phonopy calculation required to compute the renormalized force constants
+
+            # here output the kappa grid point hdf5 file
+            """ needs : 
+                frequency, 
+                gamma, 
+                grid_point, 
+                group_velocity, 
+                gv_by_gv, 
+                heat_capacity
+                kappa_unit_conversion, - 0.191298
+                mesh,
+                temperature,
+                version - 2.1.0
+                
+                name:
+                kappa-mxxx-gx.hdf5
+            """
+
+            filldata = {}
+            entries_to_fill = []
+
+            if ph3py_template is not None:
+                entries_to_fill = [
+                    "grid_point",
+                    "group_velocity",
+                    "gv_by_gv",
+                    "heat_capacity",
+                    "kappa_unit_conversion",  # 0.191298
+                    "mesh",
+                    "temperature",
+                    "version",
+                ]
+                print("using phono3py reference for group velocities")
+                templatedata = h5py.File(ph3py_template + "/" + kappafname)
+                tempid = np.where(np.array(templatedata["temperature"]) == temperature)
+                for entry in entries_to_fill:
+                    if (entry == "temperature") | (entry == "heat_capacity"):
+                        filldata[entry] = np.array(templatedata[entry][tempid])
+                    else:
+                        filldata[entry] = np.array(templatedata[entry])
+                templatedata.close()
+
+            hdf5_file = h5py.File(kappafname, "w")
+
+            hdf5_file.create_dataset(
+                "frequency", data=np.array(phonon_dict["positions"])
+            )
+
+            # the widths are 2 Gamma
+            hdf5_file.create_dataset(
+                "gamma", data=np.array([phonon_dict["widths"]]) / 2
+            )
+
+            for entry in entries_to_fill:
+                hdf5_file.create_dataset(entry, data=filldata[entry])
+
+            hdf5_file.close()
+
+            # clear all the figures
+            for mid in range(structure.get_number_of_primitive_atoms() * 3):
+                plt.figure(mid + 1)
+                plt.clf()
+
+            frequencies = phonon_dict["positions"]
+        elif renormalize_force_constants:
+            full_data = h5py.File(kappafname)
+            frequencies = full_data["frequency"][()]
+            full_data.close()
+
+        # get eigenvectors from phonopy for all equivalent q-points - frequencies are the same
+        if renormalize_force_constants:
+            gp_gpnum = np.where(bz_grid.gp_map == gpnum)[0][0]
+            equivalent_qpoints = all_qpoints[gpobj.grid_mapping_table == gp_gpnum]
+            for eqp in equivalent_qpoints:
+                arr_evs, freqs = obtain_eigenvectors_and_frequencies(
+                    structure, np.array(eqp), print_data=False
+                )
+                eigenvectors.append(arr_evs)  # Problem will be the symmetries
+                all_freqs.append(frequencies)
+                ren_qpoints.append(eqp)
+                # print(np.mean(frequencies-freqs))
+
+    # get a force constants file
+    if renormalize_force_constants:
+        print(
+            "computing renormalized force constant matrix (inverse eigenvalue problem)"
+        )
+        renorm_fc = get_renormalized_force_constants(
+            np.array(all_freqs),
+            np.array(eigenvectors),
+            structure,
+            scmat,
+            symmetrize=False,
+            comm_points=ren_qpoints
+        )
+        if np.isnan(np.sum(renorm_fc.get_array())):
+            warning_list.append("WARNING: nan values in force constant matrix")
+        phpy.file_IO.write_force_constants_to_hdf5(
+            renorm_fc.get_array(), filename="force_constants_ren.hdf5"
+        )
+        print("renormalized force constants written to force_constants_ren.hdf5")
+    else:
+        print("renormalized force constants were already present")
+        if renorm_vg:
+            print("reading from force_constants_ren.hdf5...")
+            renorm_fc = read_force_constants_hdf5("force_constants_ren.hdf5")
+
+    if not ir_yaml:
+        # now get the group velocities
+        # not done in the main loop as the renormalized FCs might not be known yet
+        if renorm_vg:
+            trajectory_2_step.structure.set_force_constants(renorm_fc)
+            ph = get_phonon(
+                trajectory_2_step.structure
+            )  # use ph object to compute group velocities
+
+            print("using renormalized force constants...")
+        else:
+            print("using original harmonic force constants...")
+
+        for qid, qp in enumerate(qpoints):
+            print("computing group velocities and heat capacities for " + str(qp))
+            gpnum = gpnums[qid]
+            kappafname = "kappa-m%d%d%d-g%d.hdf5" % (
+                scmat[0],
+                scmat[1],
+                scmat[2],
+                gpnum,
+            )
+            group_vels = ph.get_group_velocity_at_q(qp)
+            gv_by_gv_write = np.zeros(
+                (len(group_vels), 6)
+            )  # seems to be the phono3py format, not sure yet which element is which
+            # phono3py seems to be able to read the 3x3 format
+            # but this is the ordering: (xx, yy, zz, yz, xz, xy)
+            gv_by_gv = np.zeros((len(group_vels), 3, 3))
+            for gid, gv in enumerate(group_vels):
+                gv_by_gv[gid] = np.outer(gv, gv)
+                gv_by_gv_write[gid] = np.array(
+                    [
+                        gv_by_gv[gid][0, 0],
+                        gv_by_gv[gid][1, 1],
+                        gv_by_gv[gid][2, 2],
+                        gv_by_gv[gid][1, 2],
+                        gv_by_gv[gid][0, 2],
+                        gv_by_gv[gid][0, 1],
+                    ]
+                )
+
+            hdf5_file = h5py.File(kappafname, "r+")
+
+            mode_cv = get_cv([temperature], hdf5_file["frequency"])
+
+            update_h5(hdf5_file, "group_velocity", group_vels)
+            update_h5(hdf5_file, "gv_by_gv", gv_by_gv_write)
+            update_h5(hdf5_file, "temperature", np.array([temperature]))
+            update_h5(hdf5_file, "grid_point", gpnum)
+            primcell = ph.get_primitive().cell
+            volume = np.abs(np.dot(np.cross(primcell[0], primcell[1]), primcell[2]))
+            unit_to_WmK = (THz * Angstrom) ** 2 / (Angstrom**3) * EV / THz / (2 * np.pi)
+            update_h5(
+                hdf5_file, "kappa_unit_conversion", unit_to_WmK / volume
+            )  # not sure about this
+            update_h5(hdf5_file, "version", b"2.1.0", dtype="S5")
+            update_h5(hdf5_file, "mesh", np.array(scmat))
+            update_h5(hdf5_file, "heat_capacity", mode_cv)
+
+            hdf5_file.close()
+
+    qp_evaluated = len(all_errors)
+    all_errors = np.array(all_errors).ravel()
+    print(
+        "mean of all errors reported by dynaphopy: ",
+        np.sum(all_errors) / len(all_errors),
+    )
+    print(
+        "sum of all errors reported by dynaphopy divided by the number of q points evaluated: ",
+        np.sum(all_errors) / qp_evaluated,
+    )
+    print("Warnings:")
+    for warning in warning_list:
+        print(warning)
+    warning_file.close()
+
+    return
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="This script serves as a wrapper to perform dynaphopy evaluations. The primary purpose is to compute the thermal conductivity"
+    )
+
+    parser.add_argument(
+        "--silent",
+        dest="silent",
+        action="store_true",
+        default=False,
+        help="silent mode to suppress progress bars and some other output",
+    )
+    parser.add_argument(
+        "--ir_yaml",
+        dest="ir_yaml",
+        type=str,
+        default=None,
+        help="file name containing the ir_grid_points from phono3py to compute the thermal conductivity on a mesh. The mesh should be commensurate with the MD supercell. This activates the grid point mode and the script will output individual hdf5 files in the phonopy format ",
+    )
+    parser.add_argument(
+        "--read_from",
+        dest="read_from",
+        type=int,
+        default=1,
+        help="first time step to read",
+    )
+    parser.add_argument(
+        "--read_to",
+        dest="read_to",
+        type=int,
+        default=None,
+        help="last time step to read",
+    )
+    parser.add_argument(
+        "-temp",
+        "--temperature",
+        type=float,
+        default=300,
+        help="temperature of the simulation - needed when reading from phono3py reference - default 300",
+    )
+    parser.add_argument(
+        "-ts", dest="ts", type=float, default=0.001, help="time step in ps"
+    )
+    parser.add_argument(
+        "-fv",
+        "--first_val",
+        type=int,
+        default=1,
+        help="index of the first value in the trajectory file",
+    )
+    parser.add_argument(
+        "--ph3py_template",
+        dest="ph3py_template",
+        type=str,
+        default=None,
+        help="if this is specified, the other data for the kappa-XXX-gX.hdf5 files is already taken from phono3py files",
+    )
+    parser.add_argument(
+        "--renorm_vg",
+        dest="renorm_vg",
+        action="store_true",
+        default=False,
+        help="use renormalized force constants to obtain the group velocities instead of phonopy",
+    )
+
+    parser.add_argument(
+        "--nosym",
+        dest="nosym",
+        action="store_true",
+        default=False,
+        help="do not use symmetries for evaluating the mesh",
+    )
+    parser.add_argument(
+        "-r",
+        "--frequency_range",
+        metavar="F",
+        type=float,
+        nargs=2,
+        default=[0, 100],
+        help="frequency range of power spectrum in THz (min, max), default:0-100",
+    )
+
+    parser.add_argument(
+        "--resolution",
+        type=float,
+        default=0.001,
+        help="define power spectrum resolution in THz (default 0.05)",
+    )
+    parser.add_argument(
+        "--palgo",
+        dest="palgo",
+        type=int,
+        default=2,
+        help="power spectrum algorithm. 0 = real fourier transform, 1 = maximum entropy, 2 = np.fft, 3 = FFTW, 4 = CUDA FFT; default: 2",
+    )
+
+    parser.add_argument("difname", type=str, help="file name of dynaphopy input")
+    parser.add_argument(
+        "trajfname", type=str, help="file name of the original trajectory file"
+    )
+
+    args = parser.parse_args()
+
+    afp = open("p_cmnd.log", "a")
+    afp.write(" ".join(sys.argv) + "\n")
+    afp.close()
+
+    eval_dynaphopy_kappa(**vars(args))
+
+
+
+if __name__ == "__main__":
+    main()

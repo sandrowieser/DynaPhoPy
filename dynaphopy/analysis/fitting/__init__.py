@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import simpson
+from scipy.integrate import simps
 from dynaphopy.analysis.fitting import fitting_functions
 
 h_planck = 4.135667662e-3  # eV/ps
@@ -38,7 +38,8 @@ def phonon_fitting_analysis(original, ps_frequencies,
                             fitting_function_type=0,
                             show_plots=True,
                             use_degeneracy=True,
-                            show_occupancy=True):
+                            show_occupancy=True,
+                            figdir=None):
 
     widths = []
     positions = []
@@ -79,7 +80,7 @@ def phonon_fitting_analysis(original, ps_frequencies,
         maximum = fitting_parameters['maximum']
         error = fitting_parameters['global_error']
 
-        total_integral = simpson(power_spectrum, x=ps_frequencies)
+        total_integral = simps(power_spectrum, x=ps_frequencies)
 
         # Calculated properties
         dt_Q2_lor = 2 * area
@@ -143,7 +144,7 @@ def phonon_fitting_analysis(original, ps_frequencies,
         errors.append(error/maximum)
         dt_Q2_s.append(dt_Q2_lor)
 
-        if show_plots:
+        if show_plots | (figdir is not None):
             plt.figure(i+1)
 
             plt.xlabel('Frequency [THz]')
@@ -178,8 +179,11 @@ def phonon_fitting_analysis(original, ps_frequencies,
             except TypeError:
                 pass
             plt.legend()
+            plt.tight_layout()
+            if figdir is not None:
+                plt.savefig("%s/phonon_fit_%03d.png" % (figdir,i))
 
-    if show_plots:
+    if show_plots & (figdir is None):
         plt.show()
 
     return {'positions': positions,

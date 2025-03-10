@@ -264,16 +264,41 @@ def read_lammps_trajectory(file_name, structure=None, time_step=None,
                 # End testing cell
 
                 # rotate lammps supercell to match unitcell orientation
-                def unit_matrix(matrix):
-                    return np.array([np.array(row)/np.linalg.norm(row) for row in matrix])
+                # SW: the original implementation only worked in some cases
+                # I think it makes more sense to transform the primitive cell into a lower triangular form and compute the transformation matrix from that
+                
+                primcell = structure.get_cell()
+                newcell = np.zeros(np.shape(primcell))
+                # math is directly taken from the lammps documentation
+                normA = np.linalg.norm(primcell[0])
+                normB = np.linalg.norm(primcell[1])
+                normC = np.linalg.norm(primcell[2])
+                newcell[0, 0] = normA
+                newcell[1, 0] = np.dot(primcell[1], primcell[0] / normA)
+                newcell[1, 1] = np.sqrt(normB ** 2 - newcell[1, 0] ** 2)
+                newcell[2, 0] = np.dot(primcell[2], primcell[0] / normA)
+                newcell[2, 1] = (np.dot(primcell[1], primcell[2]) - newcell[1, 0] * newcell[2, 0]) / newcell[1, 1]
+                # to prevent negative square root
+                sqarg = normC ** 2 - newcell[2, 0] ** 2 - newcell[2, 1] ** 2
+                if abs(sqarg) > 1e-10:
+                    newcell[2, 2] = np.sqrt(sqarg)
+                else:
+                    newcell[2, 2] = 0.0
+                
+                transformation_mat_prim = np.matmul(np.linalg.inv(primcell), newcell)
+                supercell_matrix = np.matmul(np.linalg.inv(newcell), supercell)
+                transformation_mat = np.matmul(transformation_mat_prim, supercell_matrix)
+                
+                
+#                def unit_matrix(matrix):
+#                    return np.array([np.array(row)/np.linalg.norm(row) for row in matrix])
+#                unit_structure = unit_matrix(structure.get_cell())
+#                unit_supercell_lammps = unit_matrix(supercell)
+#
+#                transformation_mat = np.dot(np.linalg.inv(unit_structure), unit_supercell_lammps).T
 
-                unit_structure = unit_matrix(structure.get_cell())
-                unit_supercell_lammps = unit_matrix(supercell)
-
-                transformation_mat = np.dot(np.linalg.inv(unit_structure), unit_supercell_lammps).T
-
-                supercell = np.dot(supercell, transformation_mat)
-
+                supercell = np.dot(supercell, transformation_mat_prim)
+                
                 if memmap:
                     if end_cut:
                         data = np.memmap(temp_directory+'trajectory.{0}'.format(os.getpid()), dtype='complex', mode='w+', shape=(end_cut - initial_cut+1, number_of_atoms, number_of_dimensions))

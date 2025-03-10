@@ -83,7 +83,7 @@ def get_mem_power_spectra(vq, trajectory, parameters):
 
     # Check number of coefficients
     if vq.shape[0] <= parameters.number_of_coefficients_mem+1:
-        print('Number of coefficients should be smaller than the number of time steps')
+        print('Number of coefficients (%d) should be smaller than the number of time steps (%d)' % (parameters.number_of_coefficients_mem+1, vq.shape[0]))
         exit()
 
     psd_vector = []
