@@ -16,6 +16,42 @@ phonon modes.
 Online manual: http://abelcarreras.github.io/DynaPhoPy/
 
 
+
+Modification notice
+---------------------------------------------------------
+Modification of DynaPhoPy to allow for treatment of organic
+crystals and other complex systems.
+
+This branch will continue contain the exact modified version used in 
+doi:XXXXX. For further improved versions see the other branches.
+
+The changes were done for DynaPhoPy version 1.17.15
+
+List of major changes:
+- added optional feature to read the velocity trajectories on-the-fly to
+  avoid storing the trajectory in the memory. This is not meant to be 
+  used interactively but rather by calling the functions/methods 
+  directly
+- added the option to store intermediate results such as the velocity 
+  projected on the wave vectors in temporary files
+- added the option to compute specific q-points of choice for as long as
+  they are commensurate
+- added a script "eval_dynaphopy_kappa" to interface with phonopy and
+  phono3py to automatically evaluate the phonon linewidths for all 
+  irreducible grid points commensurate with the MD supercell and store 
+  the results in the phono3py hdf5 format to allow for convenient 
+  computation of the thermal conductivity using the Boltzmann transport
+  equation
+- added a feature to store the projection figures as pngs instead of 
+  showing them
+- added a feature to use the phonons previously computed via Green's 
+  function MD with the LAMMPS fix-phonon command (only partial 
+  implementation)
+- added some flexibility for the trajectory file format
+- improved parallelization for certain steps in the projection
+- fixed a bug which would lead to incorrect results for triclinic system 
+  unit cells with a non-uniform supercell vector
+
 Installation instructions
 ---------------------------------------------------------
 
