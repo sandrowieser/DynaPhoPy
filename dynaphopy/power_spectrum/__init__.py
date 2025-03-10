@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 from dynaphopy.power_spectrum import mem
 from dynaphopy.power_spectrum import correlation
 
+import scipy.signal
+
 unit_conversion = 0.00010585723  # u * A^2 * THz -> eV*ps
 
 
@@ -234,7 +236,7 @@ def _numpy_power(frequency_range, data, time_step):
 
         data_piece = data[i_p[0]:i_p[1]]
 
-        data_piece = np.correlate(data_piece, data_piece, mode='same') / data_piece.size
+        data_piece = scipy.signal.correlate(data_piece, data_piece, mode='same', method='fft') / data_piece.size
         ps.append(np.abs(np.fft.fft(data_piece))*time_step)
 
     ps = np.average(ps,axis=0)
@@ -285,7 +287,7 @@ def _fftw_power(frequency_range, data, time_step):
     for i_p in pieces:
 
         data_piece = data[i_p[0]:i_p[1]]
-        data_piece = np.correlate(data_piece, data_piece, mode='same') / data_piece.size
+        data_piece = scipy.signal.correlate(data_piece, data_piece, mode='same', method='fft') / data_piece.size
         ps.append(np.abs(pyfftw.interfaces.numpy_fft.fft(data_piece, threads=cpu_count()))*time_step)
 
     ps = np.average(ps,axis=0)
