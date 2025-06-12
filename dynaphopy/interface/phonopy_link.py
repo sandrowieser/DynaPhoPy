@@ -146,6 +146,33 @@ def obtain_eigenvectors_and_frequencies(structure, q_vector, test_orthonormal=Fa
 
     return arranged_ev, frequencies
 
+def obtain_hdf5_eigenvectors_and_frequencies(
+    q_vector, hdf5_file, print_data=True, threshold=1e-7
+):
+    """
+    Read frequencies and eigenvectors from symmetry adapted phonon calculation
+    """
+    import h5py
+
+    hdf5_data = h5py.File(hdf5_file)
+    qpoints = hdf5_data["qpoints"][()]
+    index_qvec = np.where(np.sum(np.abs(qpoints - q_vector), axis=1) < threshold)[0]
+    if len(index_qvec) > 0:
+        index_qvec = index_qvec[0]
+    else:
+        raise ValueError(f"qpoint {q_vector} not found in reference file")
+
+    frequencies = hdf5_data["frequencies"][index_qvec]
+    eigenvectors = hdf5_data["eigenvectors"][index_qvec]
+
+    arranged_ev = eigenvectors.swapaxes(0, 1).reshape((len(eigenvectors), -1, 3))
+
+    if print_data:
+        print("Harmonic frequencies (THz):")
+        print(frequencies)
+
+    return arranged_ev, frequencies
+
 
 def obtain_phonopy_dos(structure, mesh=(40, 40, 40), force_constants=None,
                        freq_min=None, freq_max=None, projected_on_atom=-1, NAC=False):

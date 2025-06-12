@@ -311,6 +311,19 @@ def read_lammps_trajectory(file_name, structure=None, time_step=None,
             file_map.seek(position_number)
             lammps_labels=file_map.readline()
 
+            # changed by SW: allows files to be read with different contents in the dump file
+            ll = lammps_labels.decode().split()
+            if b'vx vy vz' in lammps_labels:
+                index_x = ll.index('vx')
+                index_y = ll.index('vy')
+                index_z = ll.index('vz')
+            else:
+                index_x = ll.index('x')
+                index_y = ll.index('y')
+                index_z = ll.index('z')
+            # minus 2 because ITEM: ATOMS are not columns
+            indices = np.array([index_x, index_y, index_z]) - 2
+
             #Initial cut control
             if initial_cut > counter:
                 time = []
@@ -319,7 +332,7 @@ def read_lammps_trajectory(file_name, structure=None, time_step=None,
             #Reading coordinates
             read_coordinates = []
             for i in range (number_of_atoms):
-                read_coordinates.append(file_map.readline().split()[0:number_of_dimensions])
+                read_coordinates.append(file_map.readline().split()[indices])
             read_coordinates = np.array(read_coordinates, dtype=float)
 
             if template is not None:

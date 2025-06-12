@@ -6,25 +6,31 @@ Created on Fri Oct 13 12:04:37 2023
 @author: sandro_w
 
 
-This script serves as a wrapper to perform dynaphopy evaluations. The primary purpose is to compute the thermal conductivity
+This script serves as a wrapper to perform dynaphopy evaluations. 
+The primary purpose is to compute the thermal conductivity.
+Higher temperature renormalized force constants can optionally be computed.
 """
 
 import argparse
 import sys
+import dynaphopy.dynamics
 import numpy as np
 import h5py
 import os
 import matplotlib.pyplot as plt
 
 import dynaphopy
+import mmap
+import dynaphopy.dynamics
 import dynaphopy.interface.iofile as reading
 import dynaphopy.projection as projection
+
+from dynaphopy.power_spectrum import _progress_bar
 from dynaphopy.interface.phonopy_link import (
     get_force_sets_from_file,
     get_force_constants_from_file,
     ForceConstants,
 )
-from dynaphopy.interface.iofile import trajectory_parsers as tp
 
 # from phonopy.harmonic.dynmat_to_fc import DynmatToForceConstants
 from dynaphopy.interface.phonopy_link import get_phonon
@@ -50,6 +56,8 @@ from phono3py.phonon.grid import (
     get_ir_grid_points,
     get_grid_points_by_rotations,
 )
+
+import time
 
 
 def read_ir_grid_points(fname):
@@ -81,6 +89,336 @@ def read_ir_grid_points(fname):
     odict["mesh"] = mesh
     odict["qpoints"] = np.array(qps)
     return odict
+
+
+# I now moved the project functions here - make an independent package out of this with a few files to make it easier to read
+def project_onto_wave_vector_lammps_vel(
+    fname,
+    trajectory,
+    q_vector,
+    project_on_atom=-1,
+    first_vel=1,
+    interval=1,
+    start_vel=1,
+    end_vel=None,
+    silent=False,
+):
+    """
+    added by Sandro Wieser
+    memory light variant where the velocities are read on the fly instead of relying on a saved trajectory in the memory
+    the velocities read are those specific to lammps
+    first_vel ... first velocity column index in lammps file
+    interval ... interpret only every nth time step
+    start_vel ... first velocity to read
+    end_vel ... maximum number of time steps to read
+    """
+
+    start_time = time.time()
+    # Note: trajectory is a Dynamics object
+    number_of_primitive_atoms = trajectory.structure.get_number_of_primitive_atoms()
+    # if this does not work, need to compute from the supercell
+    sqmasses = np.sqrt(np.array(trajectory.structure.get_masses()))
+    supercell = (
+        trajectory.get_supercell_matrix()
+    )  # it is not a matrix, the case of it being one is still considered
+    if len(supercell.ravel()) == 3:
+        sc_multiplicity = np.prod(supercell)
+    else:
+        sc_multiplicity = int(round(np.linalg.det(supercell)))
+
+    number_of_atoms = number_of_primitive_atoms * sc_multiplicity
+    q_vector_T = []
+    velocity_projected = []
+    for qv in q_vector:
+        q_vector_T.append(qv.T)
+        velocity_projected.append([])
+    # get_velocity_mass_average multiplies the entire trajectory with the square root of the masses effectively doubling the memory demand
+    # this needs to be avoided at all costs
+    # velocity = trajectory.get_velocity_mass_average()
+
+    # fetches masses of the primitive uc
+
+    coordinates = trajectory.structure.get_positions(supercell)
+    atom_type = np.array(trajectory.structure.get_atom_type_index(supercell=supercell))
+
+    if np.shape(q_vector[0])[0] != coordinates.shape[1]:
+        print("ERROR! Q-vector and coordinates dimension do not match")
+        exit()
+
+    if (not silent) & (end_vel is not None):
+        num_to_read = end_vel - start_vel + 1
+        print(
+            "Reading %d time steps with %d atoms each..."
+            % (num_to_read, number_of_atoms)
+        )
+        _progress_bar(0, "Reading trajectory")
+
+    first_vel -= 1  # start counting at 0
+    # Here, we read the velocities and evaluate them on the fly
+    computation_time = 0
+    import multiprocessing
+
+    with open(fname) as fp:
+        atom_vels = np.zeros((number_of_atoms, 3))
+        aid = None
+        readmode = False
+        tsteps_passed = 0
+
+        with multiprocessing.Pool() as pool:
+            for line in fp:
+                elements = line.split()
+                if len(elements) >= 3:  # individual atoms
+                    if (elements[0] != "ITEM:") & readmode:
+                        atom_vels[aid] = np.array(
+                            list(map(float, elements[first_vel : first_vel + 3]))
+                        )
+                        aid += 1
+                        if aid == number_of_atoms:
+                            readmode = False
+                            # do the processing
+                            if start_vel <= (tsteps_passed + 1):
+                                ctime1 = time.time()
+                                # Projection into wave vector
+                                # parallel version
+
+                                for qid, nv in enumerate(
+                                    pool.starmap(
+                                        projection.compute_norm_vels,
+                                        [
+                                            (
+                                                qvT,
+                                                number_of_primitive_atoms,
+                                                project_on_atom,
+                                                atom_type,
+                                                atom_vels,
+                                                coordinates,
+                                                sqmasses,
+                                            )
+                                            for qvT in q_vector_T
+                                        ],
+                                    )
+                                ):
+                                    velocity_projected[qid].append(nv)
+
+                                # serial version
+                                #                                for qid, qvT in enumerate(q_vector_T):
+                                #                                    norm_vels = np.zeros((number_of_primitive_atoms,3),dtype=complex)
+                                #                                    for pid in range(number_of_primitive_atoms):
+                                #                                        # Projection on atom
+                                #                                        if project_on_atom > -1:
+                                #                                            if pid != project_on_atom:
+                                #                                                continue
+                                #                                        atom_list = pid == atom_type
+                                #        #                                print(np.shape(mult_qvec),np.shape(coordinates[atom_list,:]),np.shape(atom_vels[atom_list,:]),
+                                #        #                                      np.shape(np.dot(coordinates[atom_list,:],q_vector.T)))
+                                #                                        norm_vels[pid, :] = np.dot(atom_vels[atom_list,:].T,
+                                #                                                                   np.exp(-1j*np.dot(coordinates[atom_list,:],qvT))) * \
+                                #                                                                   sqmasses[pid]
+                                #
+                                #                                    velocity_projected[qid].append(norm_vels)
+                                computation_time += time.time() - ctime1
+
+                                if (not silent) & (end_vel is not None):
+                                    _progress_bar(
+                                        float(tsteps_passed + 1 - start_vel)
+                                        / num_to_read,
+                                        "Reading trajectory",
+                                    )
+                            tsteps_passed += 1
+                            if end_vel is not None:
+                                if tsteps_passed >= end_vel:
+                                    break
+                    elif (elements[0] == "ITEM:") & (elements[1] == "ATOMS"):
+                        readmode = True
+                        aid = 0
+
+    #    velocity = trajectory.velocity   # (use the velocity without mass average, just for testing)
+
+    # Normalize velocities (method 1)
+    #  for i in range(velocity_projected.shape[1]):
+    #      velocity_projected[:,i,:] /= atom_type.count(i)
+
+    # Normalize velocities (method 2)
+
+    velocity_projected = np.array(velocity_projected)
+    number_of_primitive_cells = number_of_atoms / number_of_primitive_atoms
+    velocity_projected /= np.sqrt(number_of_primitive_cells)
+    print(
+        "Read and projected trajectory on wave vector in %.2f s with %.2f s computation time"
+        % (time.time() - start_time, computation_time)
+    )
+    return velocity_projected
+
+
+def project_onto_wave_vector_hdf5(
+    fname,
+    trajectory,
+    q_vector,
+    project_on_atom=-1,
+    first_vel=1,
+    interval=1,
+    start_vel=1,
+    end_vel=None,
+    silent=False,
+    out_batch=None,
+    qp_obj=None,
+    qp_red=None,
+):
+    """
+    added by Sandro Wieser
+    memory light variant where the velocities are read on the fly instead of relying on a saved trajectory in the memory
+    the velocities are read from an HDF5 file
+    first_vel ... first velocity column index in lammps file
+    interval ... interpret only every nth time step
+    start_vel ... first velocity to read
+    end_vel ... maximum number of time steps to read
+    out_batch ... how many velocities are stored in memory at once
+    qp_obj ... object of the Quasiparticle class, required for consistent batch output
+    qp_red ... reduced q points to create proper file names
+    """
+    import h5py
+
+    start_time = time.time()
+    # Note: trajectory is a Dynamics object
+    number_of_primitive_atoms = trajectory.structure.get_number_of_primitive_atoms()
+    # if this does not work, need to compute from the supercell
+    sqmasses = np.sqrt(np.array(trajectory.structure.get_masses()))
+    supercell = (
+        trajectory.get_supercell_matrix()
+    )  # it is not a matrix, the case of it being one is still considered
+    if len(supercell.ravel()) == 3:
+        sc_multiplicity = np.prod(supercell)
+    else:
+        sc_multiplicity = int(round(np.linalg.det(supercell)))
+
+    number_of_atoms = number_of_primitive_atoms * sc_multiplicity
+    q_vector_T = []
+    velocity_projected = []
+    for qv in q_vector:
+        q_vector_T.append(qv.T)
+        if out_batch is None:
+            velocity_projected.append([])
+        else:
+            velocity_projected.append(
+                np.zeros((out_batch, number_of_primitive_atoms, 3), dtype=complex)
+            )
+    # get_velocity_mass_average multiplies the entire trajectory with the square root of the masses effectively doubling the memory demand
+    # this needs to be avoided at all costs
+    # velocity = trajectory.get_velocity_mass_average()
+
+    # fetches masses of the primitive uc
+
+    coordinates = trajectory.structure.get_positions(supercell)
+    atom_type = np.array(trajectory.structure.get_atom_type_index(supercell=supercell))
+
+    if np.shape(q_vector[0])[0] != coordinates.shape[1]:
+        print("ERROR! Q-vector and coordinates dimension do not match")
+        exit()
+
+    # prepare the output files
+    if out_batch is not None:
+        file_names = []
+        for qid, qp in enumerate(qp_red):
+            qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+            file_name = "vc_%s.hdf5" % (qpstr)
+            file_names.append(file_name)
+            with h5py.File(file_name, "w") as hfp:
+                hfp.create_dataset(
+                    "vc",
+                    (0, number_of_primitive_atoms, 3),
+                    dtype="complex",
+                    chunks=True,
+                    maxshape=(None, number_of_primitive_atoms, 3),
+                )
+                hfp.create_dataset(
+                    "time", (0,), dtype="float", chunks=True, maxshape=(None,)
+                )
+                hfp.create_dataset(
+                    "super_cell", data=qp_obj.dynamic.get_supercell_matrix()
+                )
+                hfp.create_dataset("reduced_q_vector", data=qp)
+
+        time_values = np.linspace(
+            0,
+            (out_batch - 1) * qp_obj.dynamic.get_time_step_average(),
+            num=out_batch,
+        )
+
+    first_vel -= 1  # start counting at 0
+    # Here, we read the velocities and evaluate them on the fly
+    computation_time = 0
+    import multiprocessing
+
+    with h5py.File(fname, "r") as hfp:
+        tsteps_passed = 0
+        # could pool this better here - but I forgot how this works
+        with multiprocessing.Pool() as pool:
+            vel_data = hfp["velocities"]
+            if end_vel != 0:
+                num_to_read = end_vel - start_vel + 1
+            else:
+                num_to_read = vel_data.shape[0] - start_vel + 1
+            if not silent:
+                print(
+                    "Reading %d time steps with %d atoms each..."
+                    % (num_to_read, number_of_atoms)
+                )
+                _progress_bar(0, "Reading trajectory")
+            for vid in range(num_to_read):
+                ctime1 = time.time()
+                atom_vels = vel_data[vid - start_vel]
+
+                for qid, nv in enumerate(
+                    pool.starmap(
+                        projection.compute_norm_vels,
+                        [
+                            (
+                                qvT,
+                                number_of_primitive_atoms,
+                                project_on_atom,
+                                atom_type,
+                                atom_vels,
+                                coordinates,
+                                sqmasses,
+                            )
+                            for qvT in q_vector_T
+                        ],
+                    )
+                ):
+                    if out_batch is None:
+                        velocity_projected[qid].append(nv)
+                    else:
+                        velocity_projected[qid][vid % out_batch] = nv
+                        if vid % out_batch == out_batch - 1:
+                            with h5py.File(file_names[qid], "a") as hfp:
+                                hfp["vc"].resize(
+                                    (hfp["vc"].shape[0] + out_batch), axis=0
+                                )
+                                hfp["vc"][-out_batch:] = velocity_projected[qid]
+                                hfp["time"].resize(
+                                    (hfp["time"].shape[0] + out_batch), axis=0
+                                )
+                                hfp["time"][-out_batch:] = time_values * (
+                                    1 + vid // out_batch
+                                )
+
+                    computation_time += time.time() - ctime1
+
+                if not silent:
+                    _progress_bar(
+                        float(tsteps_passed + 1 - start_vel) / num_to_read,
+                        "Reading trajectory",
+                    )
+                tsteps_passed += 1
+
+    velocity_projected = np.array(velocity_projected)
+    number_of_primitive_cells = number_of_atoms / number_of_primitive_atoms
+    velocity_projected /= np.sqrt(number_of_primitive_cells)
+    print(
+        "Read and projected trajectory on wave vector in %.2f s with %.2f s computation time"
+        % (time.time() - start_time, computation_time)
+    )
+    return velocity_projected
 
 
 # def get_renorm_FCmat_from_dynmats(symmetrize=True):
@@ -120,7 +458,7 @@ def read_ir_grid_points(fname):
 #    return force_constants
 
 
-def compute_vc_files(dynobj, qpoints, symmetry=True):
+def compute_vc_files(dynobj, qpoints, symmetry=True, hdf5_batch=10000):
 
     qv_recip = []
     for qp in qpoints:
@@ -132,37 +470,52 @@ def compute_vc_files(dynobj, qpoints, symmetry=True):
                 * np.linalg.inv(dynobj.dynamic.structure.get_primitive_cell()).T,
             )
         )
-    all_vc = projection.project_onto_wave_vector_lammps_vel(
-        dynobj._traj_file,
-        dynobj.dynamic,
-        np.array(qv_recip),
-        project_on_atom=dynobj.parameters.project_on_atom,
-        start_vel=dynobj._read_from,
-        end_vel=dynobj._read_to,
-        silent=dynobj.parameters.silent,
-        first_vel=dynobj._first_val,
-    )
-    dynobj.dynamic.set_time(
-        np.linspace(
-            0,
-            (all_vc[0].shape[0] - 1) * dynobj.dynamic.get_time_step_average(),
-            num=all_vc[0].shape[0],
+    if "hdf5" in dynobj._traj_file:
+        all_vc = projection.project_onto_wave_vector_hdf5(
+            dynobj._traj_file,
+            dynobj.dynamic,
+            np.array(qv_recip),
+            project_on_atom=dynobj.parameters.project_on_atom,
+            start_vel=dynobj._read_from,
+            end_vel=dynobj._read_to,
+            silent=dynobj.parameters.silent,
+            first_vel=dynobj._first_val,
+            out_batch=hdf5_batch,
+            qp_obj=dynobj,
+            qp_red=qpoints,
         )
-    )
-
-    for vid, vc in enumerate(all_vc):
-        qp = qpoints[vid]
-        qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
-        file_name = "vc_%s.hdf5" % (qpstr)
-        reading.save_data_hdf5(
-            file_name,
-            dynobj.dynamic.get_time(),
-            dynobj.dynamic.get_supercell_matrix(),
-            vc=vc,
-            reduced_q_vector=qp,
+    else:
+        all_vc = projection.project_onto_wave_vector_lammps_vel(
+            dynobj._traj_file,
+            dynobj.dynamic,
+            np.array(qv_recip),
+            project_on_atom=dynobj.parameters.project_on_atom,
+            start_vel=dynobj._read_from,
+            end_vel=dynobj._read_to,
+            silent=dynobj.parameters.silent,
+            first_vel=dynobj._first_val,
+        )
+        dynobj.dynamic.set_time(
+            np.linspace(
+                0,
+                (all_vc[0].shape[0] - 1) * dynobj.dynamic.get_time_step_average(),
+                num=all_vc[0].shape[0],
+            )
         )
 
-    dynobj._vc = all_vc[0]
+        for vid, vc in enumerate(all_vc):
+            qp = qpoints[vid]
+            qpstr = "%f_%f_%f" % (qp[0], qp[1], qp[2])
+            file_name = "vc_%s.hdf5" % (qpstr)
+            reading.save_data_hdf5(
+                file_name,
+                dynobj.dynamic.get_time(),
+                dynobj.dynamic.get_supercell_matrix(),
+                vc=vc,
+                reduced_q_vector=qp,
+            )
+
+        dynobj._vc = all_vc[0]
 
     print("Projected velocities saved in vc hdf5 files")
 
@@ -208,7 +561,290 @@ def dyn_partial_clear(dyn):
 def write_2_col(ofname, timevals, data):
     with open(ofname, "w") as fp:
         for t, d in zip(timevals, data):
-            fp.write("%12.8f %12.8f\n" % (t, d))
+            fp.write("%12.8f %16.12f\n" % (t, d))
+
+
+# LAMMPS custom dump file parser
+def read_lammps_trajectory(
+    file_name,
+    structure=None,
+    time_step=None,
+    limit_number_steps=10000000,
+    last_steps=None,
+    initial_cut=1,
+    end_cut=None,
+    memmap=False,
+    template=None,
+):
+
+    # Time in picoseconds
+    # Coordinates in Angstroms
+
+    # Read environtment variables
+    try:
+        temp_directory = os.environ["DYNAPHOPY_TEMPDIR"]
+        if os.path.isdir(temp_directory):
+            print("Set temporal directory: {0}".format(temp_directory))
+            temp_directory += "/"
+        else:
+            temp_directory = ""
+    except KeyError:
+        temp_directory = ""
+
+    number_of_atoms = None
+    bounds = None
+
+    # Check file exists
+    if not os.path.isfile(file_name):
+        print("Trajectory file does not exist!")
+        exit()
+
+    # Check time step
+    if time_step is None:
+        print("Warning! LAMMPS trajectory file does not contain time step information")
+        print("Using default: 0.001 ps")
+        time_step = 0.001
+
+    # Starting reading
+    print("Reading LAMMPS trajectory")
+    print("This may take long, please wait..")
+
+    # Dimension of LAMMP calculation
+    if structure is None:
+        number_of_dimensions = 3
+    else:
+        number_of_dimensions = structure.get_number_of_dimensions()
+
+    time = []
+    data = []
+    counter = 0
+
+    lammps_labels = False
+
+    with open(file_name, "r+") as f:
+
+        file_map = mmap.mmap(f.fileno(), 0)
+
+        while True:
+
+            counter += 1
+
+            # Read time steps
+            position_number = file_map.find(b"TIMESTEP")
+            if position_number < 0:
+                break
+
+            file_map.seek(position_number)
+            file_map.readline()
+            time.append(float(file_map.readline()))
+
+            if number_of_atoms is None:
+                # Read number of atoms
+                file_map = mmap.mmap(f.fileno(), 0)
+                position_number = file_map.find(b"NUMBER OF ATOMS")
+                file_map.seek(position_number)
+                file_map.readline()
+                number_of_atoms = int(file_map.readline())
+
+                # Check if number of atoms is multiple of cell atoms
+                if structure is not None:
+                    if number_of_atoms % structure.get_number_of_cell_atoms() != 0:
+                        print(
+                            "Warning: Number of atoms not matching, check LAMMPS output file"
+                        )
+
+            if bounds is None:
+                # Read cell
+                file_map = mmap.mmap(f.fileno(), 0)
+                position_number = file_map.find(b"BOX BOUNDS")
+                file_map.seek(position_number)
+                file_map.readline()
+
+                bounds = []
+                for i in range(3):
+                    bounds.append(file_map.readline().split())
+
+                bounds = np.array(bounds, dtype=float)
+                if bounds.shape[1] == 2:
+                    bounds = np.append(bounds, np.array([0, 0, 0])[None].T, axis=1)
+
+                xy = bounds[0, 2]
+                xz = bounds[1, 2]
+                yz = bounds[2, 2]
+
+                xlo = bounds[0, 0] - np.min([0.0, xy, xz, xy + xz])
+                xhi = bounds[0, 1] - np.max([0.0, xy, xz, xy + xz])
+                ylo = bounds[1, 0] - np.min([0.0, yz])
+                yhi = bounds[1, 1] - np.max([0.0, yz])
+                zlo = bounds[2, 0]
+                zhi = bounds[2, 1]
+
+                supercell = np.array(
+                    [[xhi - xlo, xy, xz], [0, yhi - ylo, yz], [0, 0, zhi - zlo]]
+                ).T
+
+                # for 2D
+                supercell = supercell[:number_of_dimensions, :number_of_dimensions]
+
+                # Testing cell
+                lx = xhi - xlo
+                ly = yhi - ylo
+                lz = zhi - zlo
+
+                a = lx
+                b = np.sqrt(pow(ly, 2) + pow(xy, 2))
+                c = np.sqrt(pow(lz, 2) + pow(xz, 2) + pow(yz, 2))
+
+                alpha = np.arccos((xy * xz + ly * yz) / (b * c))
+                beta = np.arccos(xz / c)
+                gamma = np.arccos(xy / b)
+
+                # End testing cell
+
+                # rotate lammps supercell to match unitcell orientation
+                # SW: the original implementation only worked in some cases
+                # I think it makes more sense to transform the primitive cell into a lower triangular form and compute the transformation matrix from that
+
+                primcell = structure.get_cell()
+                newcell = np.zeros(np.shape(primcell))
+                # math is directly taken from the lammps documentation
+                normA = np.linalg.norm(primcell[0])
+                normB = np.linalg.norm(primcell[1])
+                normC = np.linalg.norm(primcell[2])
+                newcell[0, 0] = normA
+                newcell[1, 0] = np.dot(primcell[1], primcell[0] / normA)
+                newcell[1, 1] = np.sqrt(normB**2 - newcell[1, 0] ** 2)
+                newcell[2, 0] = np.dot(primcell[2], primcell[0] / normA)
+                newcell[2, 1] = (
+                    np.dot(primcell[1], primcell[2]) - newcell[1, 0] * newcell[2, 0]
+                ) / newcell[1, 1]
+                # to prevent negative square root
+                sqarg = normC**2 - newcell[2, 0] ** 2 - newcell[2, 1] ** 2
+                if abs(sqarg) > 1e-10:
+                    newcell[2, 2] = np.sqrt(sqarg)
+                else:
+                    newcell[2, 2] = 0.0
+
+                transformation_mat_prim = np.matmul(np.linalg.inv(primcell), newcell)
+                supercell_matrix = np.matmul(np.linalg.inv(newcell), supercell)
+                transformation_mat = np.matmul(
+                    transformation_mat_prim, supercell_matrix
+                )
+                #                print(transformation_mat_prim)
+                #                print(transformation_mat)
+                #                def unit_matrix(matrix):
+                #                    return np.array([np.array(row)/np.linalg.norm(row) for row in matrix])
+                #                unit_structure = unit_matrix(structure.get_cell())
+                #                unit_supercell_lammps = unit_matrix(supercell)
+                #
+                #                transformation_mat = np.dot(np.linalg.inv(unit_structure), unit_supercell_lammps).T
+
+                supercell = np.dot(supercell, transformation_mat_prim)
+
+                if memmap:
+                    if end_cut:
+                        data = np.memmap(
+                            temp_directory + "trajectory.{0}".format(os.getpid()),
+                            dtype="complex",
+                            mode="w+",
+                            shape=(
+                                end_cut - initial_cut + 1,
+                                number_of_atoms,
+                                number_of_dimensions,
+                            ),
+                        )
+                    else:
+                        print(
+                            "Memory mapping requires to define reading range (use read_from/read_to option)"
+                        )
+                        exit()
+
+            position_number = file_map.find(b"ITEM: ATOMS")
+
+            file_map.seek(position_number)
+            lammps_labels = file_map.readline()
+
+            ll = lammps_labels.decode().split()
+            if b"vx vy vz" in lammps_labels:
+                index_x = ll.index("vx")
+                index_y = ll.index("vy")
+                index_z = ll.index("vz")
+            else:
+                index_x = ll.index("x")
+                index_y = ll.index("y")
+                index_z = ll.index("z")
+            # minus 2 because ITEM: ATOMS are not columns
+            indices = np.array([index_x, index_y, index_z]) - 2
+
+            # Initial cut control
+            if initial_cut > counter:
+                time = []
+                continue
+
+            # Reading coordinates
+            read_coordinates = []
+            for i in range(number_of_atoms):
+                read_coordinates.append(np.array(file_map.readline().split())[indices])
+            read_coordinates = np.array(read_coordinates, dtype=float)
+
+            if template is not None:
+                indexing = np.argsort(template)
+                read_coordinates = read_coordinates[indexing, :]
+
+            try:
+                read_coordinates = np.dot(read_coordinates, transformation_mat_prim)
+                if memmap:
+                    data[counter - initial_cut, :, :] = read_coordinates  # in angstroms
+                else:
+                    data.append(read_coordinates)  # in angstroms
+
+            except ValueError:
+                print("Error reading step {0}".format(counter))
+                break
+                # print(read_coordinates)
+
+            # security routine to limit maximum of steps to read and put in memory
+            if limit_number_steps + initial_cut < counter:
+                print(
+                    "Warning! maximum number of steps reached! No more steps will be read"
+                )
+                break
+
+            if end_cut is not None and end_cut <= counter:
+                break
+
+    file_map.close()
+
+    time = np.array(time) * time_step
+
+    if not memmap:
+        data = np.array(data, dtype=complex)
+
+        if last_steps is not None:
+            data = data[-last_steps:, :, :]
+            time = time[-last_steps:]
+
+    # Check position/velocity dump
+    if b"vx vy" in lammps_labels:
+        return dynaphopy.dynamics.Dynamics(
+            structure=structure,
+            velocity=data,
+            time=time,
+            supercell=supercell,
+            memmap=memmap,
+        )
+
+    if b"x y" in lammps_labels:
+        return dynaphopy.dynamics.Dynamics(
+            structure=structure,
+            trajectory=data,
+            time=time,
+            supercell=supercell,
+            memmap=memmap,
+        )
+
+    print("LAMMPS parsing error. Data not recognized: {}".format(lammps_labels))
+    exit()
 
 
 def get_renormalized_force_constants(
@@ -297,6 +933,10 @@ def eval_dynaphopy_kappa(
     palgo=2,
     resolution=0.001,
     symprec=1e-5,
+    sc_file="SPOSCAR",
+    calc_list=[],
+    vc_only=False,
+    hdf5=None,
 ):
 
     warning_list = []
@@ -348,18 +988,37 @@ def eval_dynaphopy_kappa(
         ), "Both FORCE SETS and FORCE CONSTANTS are found in input file, only one is allowed"
 
     #### INPUT PARAMETER FILE PROCESSING END ####
+    if "hdf5" not in trajfname:
+        # read trajectory
+        trajectory_reading_function = read_lammps_trajectory
 
-    # read trajectory
-    trajectory_reading_function = tp.read_lammps_trajectory
+        # Here, we read the first 2 steps to create the trajectory object containing the structure and similar information
+        # 2 steps are needed so the time step method in the dynamics object works
+        trajectory_2_step = trajectory_reading_function(
+            trajfname, structure, ts, initial_cut=0, end_cut=2
+        )
+    else:
+        # for hdf5 files do the same thing - just read like 2 steps from the trajectory and build the dynamics object
+        with h5py.File(trajfname, "r") as hfp:
+            data = hfp["velocities"][:2]
+            if "supercell" in hfp.keys():
+                supercell = hfp["supercell"][()]
+            else:
+                import ase.io
 
-    # Here, we read the first 2 steps to create the trajectory object containing the structure and similar information
-    # 2 steps are needed so the time step method in the dynamics object works
-    trajectory_2_step = trajectory_reading_function(
-        trajfname, structure, ts, initial_cut=0, end_cut=2
-    )
+                md_struct = ase.io.read(sc_file)
+                supercell = md_struct.cell
+        trajectory_2_step = dynaphopy.dynamics.Dynamics(
+            structure=structure,
+            velocity=data,
+            time=np.array(range(len(data))) * ts,
+            supercell=supercell,
+            memmap=False,
+        )
     eigenvectors = []
     all_freqs = []
-
+    # this is necessary to execute so that the dynamics object has the proper time step stored if the velocities were not output every step, might as well print it
+    print("time step average:", trajectory_2_step.get_time_step_average())
     ph = get_phonon(trajectory_2_step.structure, symprec=symprec)
 
     # phono3py version - same results as the phonopy grid points
@@ -437,7 +1096,7 @@ def eval_dynaphopy_kappa(
     #    print(gpobj.get_ir_grid_weights())
     #    print(gpobj.get_grid_mapping_table())
 
-    if os.path.exists("force_constants_ren.hdf5"):
+    if os.path.exists("force_constants_ren.hdf5") or len(calc_list) > 0:
         renormalize_force_constants = False
     else:
         renormalize_force_constants = True
@@ -508,6 +1167,7 @@ def eval_dynaphopy_kappa(
             trajectory_2_step,
             last_steps=None,
             traj_file=trajfname,
+            hdf5_file=hdf5,
             read_from=read_from,
             read_to=read_to,
             first_val=first_val,
@@ -515,7 +1175,8 @@ def eval_dynaphopy_kappa(
         calculation.parameters.silent = silent
         calculation.set_reduced_q_vector(np.array(qp))
         compute_vc_files(calculation, to_compute)
-
+    if vc_only:
+        return
     all_errors = []
     ren_qpoints = []
     for qid, qp in enumerate(qpoints):
@@ -523,7 +1184,11 @@ def eval_dynaphopy_kappa(
         kappafname = "kappa-m%d%d%d-g%d.hdf5" % (scmat[0], scmat[1], scmat[2], gpnum)
 
         if not os.path.exists(kappafname):
-            calc_gp = True
+            if (qid not in calc_list) and len(calc_list) > 0:
+                print("skipping grid point %d" % gpnum)
+                calc_gp = False
+            else:
+                calc_gp = True
         else:
             calc_gp = False
             print("found %s, skipping grid point %d" % (kappafname, gpnum))
@@ -537,12 +1202,12 @@ def eval_dynaphopy_kappa(
             print("loading file " + vc_files[qid] + " for q-point " + str(qp) + "...")
             vc_file_name = vc_files[qid]
             vcdata = h5py.File(vc_file_name)
-            if read_to is not None:
-                vcvals = vcdata["vc"][read_from - 1 : read_to]
-                timevals = vcdata["time"][read_from - 1 : read_to]
+            if args.read_to is not None:
+                vcvals = vcdata["vc"][args.read_from - 1 : args.read_to]
+                timevals = vcdata["time"][args.read_from - 1 : args.read_to]
             else:
-                vcvals = vcdata["vc"][read_from - 1 :]
-                timevals = vcdata["time"][read_from - 1 :]
+                vcvals = vcdata["vc"][args.read_from - 1 :]
+                timevals = vcdata["time"][args.read_from - 1 :]
             trajectory_2_step.set_time(np.array(timevals))
             trajectory = [
                 np.array(vcvals),
@@ -550,7 +1215,11 @@ def eval_dynaphopy_kappa(
                 trajectory_2_step,
             ]
             calculation = dynaphopy.Quasiparticle(
-                trajectory[2], vc=trajectory[0], last_steps=None, figdir=figdir
+                trajectory[2],
+                vc=trajectory[0],
+                last_steps=None,
+                figdir=figdir,
+                hdf5_file=hdf5,
             )
             calculation.parameters.silent = silent
             input_parameters.update(
@@ -696,7 +1365,7 @@ def eval_dynaphopy_kappa(
             structure,
             scmat,
             symmetrize=False,
-            comm_points=ren_qpoints
+            comm_points=ren_qpoints,
         )
         if np.isnan(np.sum(renorm_fc.get_array())):
             warning_list.append("WARNING: nan values in force constant matrix")
@@ -790,7 +1459,7 @@ def eval_dynaphopy_kappa(
     return
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="This script serves as a wrapper to perform dynaphopy evaluations. The primary purpose is to compute the thermal conductivity"
     )
@@ -863,6 +1532,13 @@ def main():
         help="do not use symmetries for evaluating the mesh",
     )
     parser.add_argument(
+        "--vc_only",
+        dest="vc_only",
+        action="store_true",
+        default=False,
+        help="only generate vc files, do not perform the evaluation",
+    )
+    parser.add_argument(
         "-r",
         "--frequency_range",
         metavar="F",
@@ -876,7 +1552,7 @@ def main():
         "--resolution",
         type=float,
         default=0.001,
-        help="define power spectrum resolution in THz (default 0.05)",
+        help="define power spectrum resolution in THz (default 0.001)",
     )
     parser.add_argument(
         "--palgo",
@@ -885,10 +1561,34 @@ def main():
         default=2,
         help="power spectrum algorithm. 0 = real fourier transform, 1 = maximum entropy, 2 = np.fft, 3 = FFTW, 4 = CUDA FFT; default: 2",
     )
+    parser.add_argument(
+        "--sc_file",
+        dest="sc_file",
+        type=str,
+        default="SPOSCAR",
+        help="structure file required for using the hdf5 read mode when the supercell is not included in the h5 keys. should contain supercell structure in MD.",
+    )
+    parser.add_argument(
+        "--hdf5",
+        dest="hdf5",
+        type=str,
+        default=None,
+        help="read phonon information from hdf5 files. needs dataset keys qpoints eigenvectors and frequencies",
+    )
+    parser.add_argument(
+        "--calc_list",
+        dest="calc_list",
+        type=int,
+        nargs="*",
+        default=[],
+        help="manual list of indices for q-points to evaluate the FTs for. These are NOT the grid points. It is a number from 0 to the total number of q-points to be evaluated minus 1.",
+    )
 
     parser.add_argument("difname", type=str, help="file name of dynaphopy input")
     parser.add_argument(
-        "trajfname", type=str, help="file name of the original trajectory file"
+        "trajfname",
+        type=str,
+        help="file name of the original trajectory file. If a hdf5 file is specified, the hdf5 reader is used",
     )
 
     args = parser.parse_args()
@@ -898,8 +1598,3 @@ def main():
     afp.close()
 
     eval_dynaphopy_kappa(**vars(args))
-
-
-
-if __name__ == "__main__":
-    main()
